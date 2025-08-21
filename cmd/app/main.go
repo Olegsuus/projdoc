@@ -1,3 +1,4 @@
+// cmd/app/main.go
 package main
 
 import (
@@ -14,24 +15,27 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
-// ---------- CLI flags ----------
 var (
-	srcDir                   = flag.String("src", ".", "Go source root")
-	migDir                   = flag.String("migrations", "./migrations", "SQL migrations dir")
-	outFile                  = flag.String("out", "docs.md", "Output markdown file")
-	emitMermaid              = flag.Bool("mermaid", true, "Emit Mermaid ER diagram")
-	sqlExts                  = []string{".sql"}
-	goSkipVendor             = true
+	srcDir      = flag.String("src", ".", "Go source root")
+	migDir      = flag.String("migrations", "./migrations", "SQL migrations dir")
+	outFile     = flag.String("out", "docs.md", "Output markdown file")
+	emitMermaid = flag.Bool("mermaid", true, "Emit Mermaid ER diagram")
+	openapiOut  = flag.String("openapi", "", "Write OpenAPI 3.0 yaml to this file if set")
+
+	goSkipVendor = true
+
 	reIsTableLevelConstraint = regexp.MustCompile(`(?is)^\s*(PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE|CHECK|CONSTRAINT|EXCLUDE|INDEX)\b`)
 	reTrimQuotes             = regexp.MustCompile(`^"(.*)"$`)
 )
 
-// ---------- Data models ----------
+// ========================= Data models =========================
+
 type DocItem struct {
-	Section string // service|repo|endpoint|domain|model
+	Section string // endpoint|service|repo|domain|model
 	ID      string
 	Summary string
 	Details string
@@ -39,13 +43,20 @@ type DocItem struct {
 	Errors  []string
 	Example string
 
-	RepoQuery  string // "@doc.repo.query"
-	ServiceUC  string // "@doc.service.usecase"
+	RepoQuery  string
+	ServiceUC  string
 	SourceFile string
 	SourceLine int
-	GoSymbol   string // func/receiver/package name
+	GoSymbol   string
 
-	Extra map[string]string // любые @doc.<key>, которые мы не распарсили в фикс-поля
+	Extra map[string]string // любые @doc.<key>
+
+	// Автодополненные поля из анализа
+	RequestType  string
+	ResponseType string
+	Statuses     []int
+	Route        *Route
+	Calls        []string // человекочитаемые call targets
 }
 
 type Table struct {
@@ -91,306 +102,186 @@ type Model struct {
 	SourceFile  string
 	SourceLine  int
 	Name        string // Go type name
-
-	Fields []ModelField
+	Fields      []ModelField
 }
 
 type ModelField struct {
-	Name     string // Go имя
-	Type     string // Go тип (как строка)
+	Name     string
+	Type     string
 	JSON     string
 	DB       string
 	Validate []string
-	DocTags  []string // из doc:"..."
-	Comment  string   // комментарий над полем
+	DocTags  []string
+	Comment  string
 }
 
-// глобальный сборщик моделей из parseGoDocs
 var collectedModels []Model
 
-// ---------- Main ----------
+// Routes
+type Route struct {
+	Method     string
+	Path       string
+	Auth       bool
+	File       string
+	Line       int
+	HandlerSym string
+}
+
+// Call graph
+type FuncKey struct {
+	Pkg string // файл->пакет
+	Rec string // получатель (напр. *clientService)
+	Nom string // имя (напр. SelectManyClients)
+}
+
+func (k FuncKey) String() string {
+	if k.Rec != "" {
+		return fmt.Sprintf("(%s).%s", k.Rec, k.Nom)
+	}
+	if k.Pkg != "" {
+		return k.Pkg + "." + k.Nom
+	}
+	return k.Nom
+}
+
+type FuncDeclInfo struct {
+	Key     FuncKey
+	File    string
+	Line    int
+	Calls   []string // собранные имена вызовов (сырье)
+	Comment string
+}
+
+// ========================= Main =========================
+
 func main() {
 	flag.Parse()
 
-	// 1) Парсим миграции (без БД)
+	// 1) SQL
 	tables, _ := parseMigrations(*migDir)
 
-	// 2) Парсим Go-комментарии с @doc.* (и модели)
-	docs := parseGoDocs(*srcDir)
+	// 2) Сбор функций (для call graph)
+	funcs := collectAllFunctions(*srcDir)
 
-	// 3) Рендерим Markdown
+	// 3) Go @doc.* (включая внутренние комментарии) и модели
+	docs := parseGoDocs(*srcDir, funcs)
+
+	// 4) Роуты Fiber
+	routes := parseFiberRoutes(*srcDir)
+
+	// 5) Сопоставим роуты к endpoint-докам по имени хендлера
+	attachRoutes(docs, routes)
+
+	// 6) Обогатим call graph: сопоставим «сырье» к DocItem’ам
+	resolveCallGraph(docs, funcs)
+
+	// 7) Markdown
 	md := renderMarkdown(tables, docs, collectedModels, *emitMermaid)
-
 	if err := os.WriteFile(*outFile, md, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", *outFile, err)
 		os.Exit(1)
 	}
 	fmt.Printf("Generated %s\n", *outFile)
+
+	// 8) OpenAPI (минимальный)
+	if strings.TrimSpace(*openapiOut) != "" {
+		if err := writeOpenAPI(*openapiOut, docs); err != nil {
+			fmt.Fprintf(os.Stderr, "openapi: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Generated %s\n", *openapiOut)
+	}
 }
 
-// very rough statement splitter — good enough for typical migrations
-func splitSQLStatements(sql string) []string {
-	var out []string
-	var buf strings.Builder
-	inStr := false
-	var quote rune
+// ========================= SQL parsing =========================
 
-	for _, r := range sql {
-		if inStr {
-			buf.WriteRune(r)
-			if r == quote {
-				inStr = false
-			}
-			continue
-		}
-		switch r {
-		case '\'', '"', '`':
-			inStr = true
-			quote = r
-			buf.WriteRune(r)
-		case ';':
-			stmt := strings.TrimSpace(buf.String())
-			if stmt != "" {
-				out = append(out, stmt)
-			}
-			buf.Reset()
-		default:
-			buf.WriteRune(r)
-		}
-	}
-	if s := strings.TrimSpace(buf.String()); s != "" {
-		out = append(out, s)
-	}
-	return out
-}
+var (
+	reCreateTableStmt = regexp.MustCompile(`(?is)CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("?[\w\.]+"?)\s*$begin:math:text$(.*?)$end:math:text$\s*;`)
+	reCreateIndexStmt = regexp.MustCompile(`(?is)CREATE\s+(UNIQUE\s+)?INDEX\s+("?[\w\.]+"?)\s+ON\s+("?[\w\.]+"?)\s*$begin:math:text$([^)]+)$end:math:text$\s*;`)
+	reAlterTableStmt  = regexp.MustCompile(`(?is)ALTER\s+TABLE\s+("?[\w\.]+"?)\s+(ADD\s+CONSTRAINT\s+[^;]+|ADD\s+COLUMN\s+[^;]+);`)
+	rePkTable         = regexp.MustCompile(`(?is)PRIMARY\s+KEY\s*$begin:math:text$([^)]+)$end:math:text$`)
+	reFk              = regexp.MustCompile(`(?is)FOREIGN\s+KEY\s*$begin:math:text$([^)]+)$end:math:text$\s*REFERENCES\s+("?[\w\.]+"?)\s*$begin:math:text$([^)]+)$end:math:text$([^,)]*)`)
+	reColLine         = regexp.MustCompile(`(?is)^\s*("?[\w\.]+"?)\s+([^\s,]+)(.*)$`)
+	rePkInline        = regexp.MustCompile(`(?is)\bPRIMARY\s+KEY\b`)
+)
 
 func parseMigrations(dir string) ([]Table, error) {
 	if dir == "" {
 		return nil, errors.New("parseMigrations: empty dir")
 	}
+	schema := map[string]*Table{}
 
-	var tables []Table
-
-	walkFn := func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(path), ".sql") {
 			return nil
 		}
-		if !strings.HasSuffix(strings.ToLower(d.Name()), ".sql") {
-			return nil
-		}
-
 		b, err := os.ReadFile(path)
 		if err != nil {
-			return err
+			return nil
 		}
 		content := sanitizeSQL(string(b))
 
-		// ВАЖНО: FindAllStringSubmatch — ловим все CREATE TABLE в одном файле
-		matches := reCreateTable.FindAllStringSubmatch(content, -1)
-		for _, m := range matches {
-			if len(m) < 4 {
-				continue
+		// CREATE TABLE
+		for _, m := range reCreateTableStmt.FindAllStringSubmatch(content, -1) {
+			name := unq(m[2])
+			body := strings.TrimSpace(m[3])
+			t := parseCreateTableBody(name, body)
+			upsertTable(schema, &t)
+		}
+		// CREATE INDEX
+		for _, m := range reCreateIndexStmt.FindAllStringSubmatch(content, -1) {
+			ix := Index{
+				Unique:  strings.TrimSpace(m[1]) != "",
+				Name:    unq(m[2]),
+				Table:   unq(m[3]),
+				Columns: normList(m[4]),
 			}
-
-			rawName := strings.TrimSpace(m[2]) // может быть "schema.table" или "table"
-			rawName = strings.TrimSpace(rawName)
-			if reTrimQuotes.MatchString(rawName) {
-				rawName = reTrimQuotes.ReplaceAllString(rawName, "$1")
+			if t := schema[ix.Table]; t != nil {
+				t.Indexes = upsertIndex(t.Indexes, ix)
 			}
-			colsBlock := strings.TrimSpace(m[3])
-
-			cols := parseColumns(colsBlock)
-
-			tables = append(tables, Table{
-				Name:    rawName,
-				Columns: cols,
-				//RawDefinition: colsBlock,
-			})
+		}
+		// ALTER TABLE
+		for _, m := range reAlterTableStmt.FindAllStringSubmatch(content, -1) {
+			tbl := unq(m[1])
+			stmt := strings.TrimSpace(m[2])
+			applyAlter(schema, tbl, stmt)
 		}
 		return nil
-	}
-
-	if err := filepath.WalkDir(dir, walkFn); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
-	return tables, nil
+
+	// to slice
+	var out []Table
+	for _, t := range schema {
+		out = append(out, *t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
-// -------------------- вспомогалки для колонок --------------------
-
-// parseColumns наивно разбивает содержимое скобок CREATE TABLE на колонки,
-// учитывая вложенные скобки, чтобы не резать по запятым внутри CHECK(...), REFERENCES(...).
-func parseColumns(block string) []Column {
-	parts := splitByCommasRespectingParens(block)
-
-	var cols []Column
-	for _, p := range parts {
-		line := strings.TrimSpace(p)
-		if line == "" {
-			continue
-		}
-		// пропускаем table-level constraints
-		if reIsTableLevelConstraint.MatchString(line) {
-			continue
-		}
-
-		// имя может быть в кавычках
-		toks := splitBySpaceRespectingQuotes(line)
-		if len(toks) < 2 {
-			// странная строка — пропустим
-			continue
-		}
-
-		colName := strings.TrimSpace(toks[0])
-		if reTrimQuotes.MatchString(colName) {
-			colName = reTrimQuotes.ReplaceAllString(colName, "$1")
-		}
-
-		typeEnd := findTypeEndIndex(toks[1:])
-		colType := strings.Join(toks[1:1+typeEnd], " ")
-
-		cols = append(cols, Column{
-			Name: colName,
-			Type: colType,
-		})
+func upsertTable(schema map[string]*Table, t *Table) {
+	if old, ok := schema[t.Name]; ok {
+		schema[t.Name] = mergeTables(old, t)
+	} else {
+		cp := *t
+		schema[t.Name] = &cp
 	}
-
-	return cols
 }
 
-// splitByCommasRespectingParens режет строку по запятым, но игнорирует запятые внутри скобок.
-func splitByCommasRespectingParens(s string) []string {
-	var res []string
-	var buf strings.Builder
-	depth := 0
-
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		switch ch {
-		case '(':
-			depth++
-			buf.WriteByte(ch)
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-			buf.WriteByte(ch)
-		case ',':
-			if depth == 0 {
-				res = append(res, buf.String())
-				buf.Reset()
-			} else {
-				buf.WriteByte(ch)
-			}
-		default:
-			buf.WriteByte(ch)
-		}
-	}
-	if buf.Len() > 0 {
-		res = append(res, buf.String())
-	}
-	return res
-}
-
-// splitBySpaceRespectingQuotes разбивает на токены по пробелам с учётом кавычек.
-func splitBySpaceRespectingQuotes(s string) []string {
-	var res []string
-	var buf strings.Builder
-	inQuotes := false
-
-	flush := func() {
-		if buf.Len() > 0 {
-			res = append(res, buf.String())
-			buf.Reset()
-		}
-	}
-
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		switch ch {
-		case '"':
-			inQuotes = !inQuotes
-			buf.WriteByte(ch)
-		case ' ', '\t', '\n', '\r':
-			if inQuotes {
-				buf.WriteByte(ch)
-			} else {
-				flush()
-			}
-		default:
-			buf.WriteByte(ch)
-		}
-	}
-	flush()
-	return res
-}
-
-// findTypeEndIndex ищет, сколько токенов относятся к типу до начала constraint-части.
-func findTypeEndIndex(tokens []string) int {
-	if len(tokens) == 0 {
-		return 0
-	}
-	// минимальный набор "стоп-слов" для constraint-части
-	stop := map[string]struct{}{
-		"PRIMARY":    {},
-		"KEY":        {},
-		"NOT":        {},
-		"NULL":       {},
-		"UNIQUE":     {},
-		"REFERENCES": {},
-		"CHECK":      {},
-		"DEFAULT":    {},
-		"COLLATE":    {},
-		"CONSTRAINT": {},
-	}
-	end := 0
-	for end < len(tokens) {
-		up := strings.ToUpper(strings.Trim(tokens[end], ","))
-		if _, found := stop[up]; found {
-			break
-		}
-		end++
-	}
-	if end == 0 {
-		return 1 // хотя бы один токен считаем типом
-	}
-	return end
-}
-
-var (
-	reCreateTable = regexp.MustCompile(`(?is)CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("?[\w.]+?"?)\s*$begin:math:text$(.*?)$end:math:text$`)
-	reColLine     = regexp.MustCompile(`(?is)^\s*("?[\w.]+"?)\s+([^\s,]+)(.*)$`)
-	rePkInline    = regexp.MustCompile(`(?is)PRIMARY\s+KEY\s*\(([^)]+)\)`)
-	reFk          = regexp.MustCompile(`(?is)CONSTRAINT\s+"?[\w.]+"?\s+FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+("?[\w.]+"?)\s*\(([^)]+)\)([^,]*)`)
-	rePkTable     = regexp.MustCompile(`(?is)CONSTRAINT\s+"?[\w.]+"?\s+PRIMARY\s+KEY\s*\(([^)]+)\)`)
-	reCreateIdx   = regexp.MustCompile(`(?is)CREATE\s+(UNIQUE\s+)?INDEX\s+("?[\w.]+"?)\s+ON\s+("?[\w.]+"?)\s*\(([^)]+)\)`)
-)
-
-func parseCreateTable(s string) Table {
-	m := reCreateTable.FindStringSubmatch(s)
-	if len(m) < 3 {
-		return Table{}
-	}
-	name := unq(m[1])
-	body := m[2]
-
+func parseCreateTableBody(name, body string) Table {
 	t := Table{Name: name}
-
-	// split by commas at top-level (no parens)
 	parts := splitTopLevelCommas(body)
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
+	for _, raw := range parts {
+		p := strings.TrimSpace(raw)
 		up := strings.ToUpper(p)
 
 		// table-level PK
 		if pm := rePkTable.FindStringSubmatch(p); len(pm) == 2 {
-			t.PrimaryKey = normList(pm[1])
+			t.PrimaryKey = upsertCols(t.PrimaryKey, normList(pm[1])...)
 			continue
 		}
-
 		// table-level FK
 		if fm := reFk.FindStringSubmatch(p); len(fm) >= 5 {
 			fk := ForeignKey{
@@ -408,112 +299,38 @@ func parseCreateTable(s string) Table {
 			t.Foreign = append(t.Foreign, fk)
 			continue
 		}
-
-		// column line
+		// column
 		if cm := reColLine.FindStringSubmatch(p); len(cm) >= 4 && !strings.HasPrefix(up, "CONSTRAINT ") {
 			col := Column{
 				Name: unq(cm[1]),
 				Type: strings.TrimSpace(cm[2]),
 				Null: !strings.Contains(strings.ToUpper(cm[3]), "NOT NULL"),
 			}
-			// inline PK
-			if rePkInline.MatchString(p) {
-				t.PrimaryKey = append(t.PrimaryKey, col.Name)
+			if rePkInline.MatchString(p) { // inline PK
+				t.PrimaryKey = upsertCols(t.PrimaryKey, col.Name)
 			}
 			t.Columns = append(t.Columns, col)
 			continue
 		}
 	}
-
 	return t
 }
 
-func splitTopLevelCommas(s string) []string {
-	var out []string
-	var lvl int
-	var buf strings.Builder
-	inStr := false
-	var quote rune
-
-	for _, r := range s {
-		if inStr {
-			buf.WriteRune(r)
-			if r == quote {
-				inStr = false
-			}
-			continue
-		}
-		switch r {
-		case '\'', '"', '`':
-			inStr = true
-			quote = r
-			buf.WriteRune(r)
-		case '(':
-			lvl++
-			buf.WriteRune(r)
-		case ')':
-			lvl--
-			buf.WriteRune(r)
-		case ',':
-			if lvl == 0 {
-				out = append(out, strings.TrimSpace(buf.String()))
-				buf.Reset()
-			} else {
-				buf.WriteRune(r)
-			}
-		default:
-			buf.WriteRune(r)
-		}
-	}
-	if s := strings.TrimSpace(buf.String()); s != "" {
-		out = append(out, s)
-	}
-	return out
-}
-
-func parseCreateIndex(s string) Index {
-	m := reCreateIdx.FindStringSubmatch(s)
-	if len(m) < 5 {
-		return Index{}
-	}
-	unique := strings.TrimSpace(m[1]) != ""
-	name := unq(m[2])
-	table := unq(m[3])
-	cols := normList(m[4])
-	return Index{Name: name, Table: table, Columns: cols, Unique: unique}
-}
-
-func applyAlter(schema map[string]*Table, s string) {
-	// простейшие случаи: ADD CONSTRAINT PK/FK, ADD COLUMN
-	up := strings.ToUpper(s)
-	parts := strings.Fields(up)
-	if len(parts) < 3 || parts[0] != "ALTER" || parts[1] != "TABLE" {
-		return
-	}
-	// имя таблицы после ALTER TABLE
-	tname := unq(strings.Fields(strings.TrimPrefix(strings.TrimSpace(s), parts[0]+" "+parts[1]))[0])
-	t := schema[tname]
+func applyAlter(schema map[string]*Table, tableName, stmt string) {
+	up := strings.ToUpper(stmt)
+	t := schema[tableName]
 	if t == nil {
-		t = &Table{Name: tname}
-		schema[tname] = t
+		t = &Table{Name: tableName}
+		schema[tableName] = t
 	}
-
-	// ADD COLUMN
-	if strings.Contains(up, "ADD COLUMN") {
-		raw := takeAfter(s, "ADD COLUMN")
-		line := strings.TrimSpace(raw)
-		seg := line
-		if i := strings.Index(seg, ","); i > 0 {
-			seg = seg[:i]
-		}
-		if i := strings.Index(seg, ";"); i > 0 {
-			seg = seg[:i]
-		}
-		cm := reColLine.FindStringSubmatch(seg)
-		if len(cm) >= 4 {
-			col := Column{Name: unq(cm[1]), Type: strings.TrimSpace(cm[2]),
-				Null: !strings.Contains(strings.ToUpper(cm[3]), "NOT NULL")}
-			// upsert
+	if strings.HasPrefix(up, "ADD COLUMN") {
+		raw := strings.TrimSpace(stmt[len("ADD COLUMN"):])
+		if cm := reColLine.FindStringSubmatch(raw); len(cm) >= 4 {
+			col := Column{
+				Name: unq(cm[1]),
+				Type: strings.TrimSpace(cm[2]),
+				Null: !strings.Contains(strings.ToUpper(cm[3]), "NOT NULL"),
+			}
 			found := false
 			for i := range t.Columns {
 				if t.Columns[i].Name == col.Name {
@@ -527,19 +344,8 @@ func applyAlter(schema map[string]*Table, s string) {
 			}
 		}
 	}
-
-	// ADD CONSTRAINT PRIMARY KEY(...)
-	if rePkTable.MatchString(s) {
-		pm := rePkTable.FindStringSubmatch(s)
-		if len(pm) == 2 {
-			t.PrimaryKey = upsertCols(t.PrimaryKey, normList(pm[1])...)
-		}
-	}
-
-	// ADD CONSTRAINT ... FOREIGN KEY (...)
-	if reFk.MatchString(s) {
-		fm := reFk.FindStringSubmatch(s)
-		if len(fm) >= 5 {
+	if strings.Contains(up, "FOREIGN KEY") {
+		if fm := reFk.FindStringSubmatch(stmt); len(fm) >= 5 {
 			fk := ForeignKey{
 				Cols:     normList(fm[1]),
 				RefTable: unq(fm[2]),
@@ -555,13 +361,14 @@ func applyAlter(schema map[string]*Table, s string) {
 			t.Foreign = append(t.Foreign, fk)
 		}
 	}
+	if strings.Contains(up, "PRIMARY KEY") {
+		if pm := rePkTable.FindStringSubmatch(stmt); len(pm) == 2 {
+			t.PrimaryKey = upsertCols(t.PrimaryKey, normList(pm[1])...)
+		}
+	}
 }
 
 func mergeTables(old, cur *Table) *Table {
-	if old == nil {
-		return cur
-	}
-	// upsert columns
 	for _, c := range cur.Columns {
 		found := false
 		for i := range old.Columns {
@@ -607,8 +414,7 @@ func upsertIndex(dst []Index, in Index) []Index {
 func normList(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {
-		p = strings.TrimSpace(p)
-		p = strings.Trim(p, `"`)
+		p = strings.TrimSpace(strings.Trim(p, `"`))
 		if p != "" {
 			out = append(out, p)
 		}
@@ -626,8 +432,193 @@ func takeAfter(s, token string) string {
 	return s[i+len(token):]
 }
 
-// ---------- Go @doc.* parsing ----------
-func parseGoDocs(root string) []DocItem {
+func sanitizeSQL(s string) string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "-- +goose") {
+			continue
+		}
+		if idx := strings.Index(ln, "--"); idx >= 0 {
+			ln = ln[:idx]
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
+}
+
+func splitTopLevelCommas(s string) []string {
+	var out []string
+	var lvl int
+	var buf strings.Builder
+	inStr := false
+	var quote rune
+
+	for _, r := range s {
+		if inStr {
+			buf.WriteRune(r)
+			if r == quote {
+				inStr = false
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"', '`':
+			inStr = true
+			quote = r
+			buf.WriteRune(r)
+		case '(':
+			lvl++
+			buf.WriteRune(r)
+		case ')':
+			lvl--
+			buf.WriteRune(r)
+		case ',':
+			if lvl == 0 {
+				out = append(out, strings.TrimSpace(buf.String()))
+				buf.Reset()
+			} else {
+				buf.WriteRune(r)
+			}
+		default:
+			buf.WriteRune(r)
+		}
+	}
+	if s := strings.TrimSpace(buf.String()); s != "" {
+		out = append(out, s)
+	}
+	return out
+}
+
+// ========================= AST helpers =========================
+
+func exprString(e ast.Expr) string {
+	switch v := e.(type) {
+	case *ast.Ident:
+		return v.Name
+	case *ast.StarExpr:
+		return "*" + exprString(v.X)
+	case *ast.SelectorExpr:
+		return exprString(v.X) + "." + v.Sel.Name
+	case *ast.ArrayType:
+		return "[]" + exprString(v.Elt)
+	case *ast.MapType:
+		return "map[" + exprString(v.Key) + "]" + exprString(v.Value)
+	case *ast.InterfaceType:
+		return "interface{}"
+	case *ast.FuncType:
+		return "func"
+	default:
+		return fmt.Sprintf("%T", e)
+	}
+}
+
+func getTagValue(f *ast.Field, key string) string {
+	if f.Tag == nil {
+		return ""
+	}
+	raw := strings.Trim(f.Tag.Value, "`")
+	for _, part := range strings.Split(raw, " ") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, key+":") {
+			val := strings.TrimPrefix(part, key+":")
+			val = strings.Trim(val, `"`)
+			return val
+		}
+	}
+	return ""
+}
+
+func cleanJSONName(tag, fallback string) string {
+	if tag == "" {
+		return fallback
+	}
+	name := strings.Split(tag, ",")[0]
+	if name == "" || name == "-" {
+		return "-"
+	}
+	return name
+}
+
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// ========================= Collect functions (for call graph) =========================
+
+func collectAllFunctions(root string) map[string]FuncDeclInfo {
+	fset := token.NewFileSet()
+	funcs := map[string]FuncDeclInfo{}
+
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		if goSkipVendor && (strings.Contains(path, "/vendor/") || strings.Contains(path, "/.git/")) {
+			return nil
+		}
+		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.AllErrors)
+		if err != nil {
+			return nil
+		}
+		pkg := file.Name.Name
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			fd, ok := n.(*ast.FuncDecl)
+			if !ok {
+				return true
+			}
+			var rec string
+			if fd.Recv != nil && len(fd.Recv.List) > 0 {
+				rec = exprString(fd.Recv.List[0].Type)
+			}
+			key := FuncKey{Pkg: pkg, Rec: rec, Nom: fd.Name.Name}
+			pos := fset.Position(fd.Pos())
+
+			// собрать "сырьё" вызовов
+			var calls []string
+			ast.Inspect(fd.Body, func(nn ast.Node) bool {
+				ce, ok := nn.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				switch fn := ce.Fun.(type) {
+				case *ast.SelectorExpr:
+					calls = append(calls, exprString(fn))
+				case *ast.Ident:
+					calls = append(calls, fn.Name)
+				}
+				return true
+			})
+
+			funcs[key.String()] = FuncDeclInfo{
+				Key:   key,
+				File:  pos.Filename,
+				Line:  pos.Line,
+				Calls: calls,
+			}
+			return true
+		})
+		return nil
+	})
+
+	return funcs
+}
+
+// ========================= Go @doc + Models + Handler meta + inner @doc =========================
+
+func parseGoDocs(root string, funcs map[string]FuncDeclInfo) []DocItem {
 	var goFiles []string
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -649,12 +640,12 @@ func parseGoDocs(root string) []DocItem {
 	fset := token.NewFileSet()
 
 	for _, gf := range goFiles {
-		file, err := parser.ParseFile(fset, gf, nil, parser.ParseComments)
+		file, err := parser.ParseFile(fset, gf, nil, parser.ParseComments|parser.AllErrors)
 		if err != nil {
 			continue
 		}
 
-		// file-level comments (package doc)
+		// file-level comments
 		if file.Doc != nil {
 			it := makeDocItemFromCommentBlock(file.Doc.Text())
 			if it != nil {
@@ -670,13 +661,33 @@ func parseGoDocs(root string) []DocItem {
 		for _, d := range file.Decls {
 			switch nd := d.(type) {
 			case *ast.FuncDecl:
-				if nd.Doc == nil {
+				if nd.Doc == nil && nd.Body == nil {
 					continue
 				}
-				it := makeDocItemFromCommentBlock(nd.Doc.Text())
+				// внешний докблок
+				var it *DocItem
+				if nd.Doc != nil {
+					it = makeDocItemFromCommentBlock(nd.Doc.Text())
+				}
+				// внутренние @doc.* (в теле)
+				if nd.Body != nil && file.Comments != nil {
+					for _, cg := range file.Comments {
+						if cg.Pos() >= nd.Body.Pos() && cg.End() <= nd.Body.End() {
+							if inner := makeDocItemFromCommentBlock(cg.Text()); inner != nil {
+								if it == nil {
+									it = inner
+								} else {
+									mergeDocItems(it, inner)
+								}
+							}
+						}
+					}
+				}
 				if it == nil {
+					// даже без @doc — попытаемся для endpoint вытянуть метаданные, если он будет сопоставлен по роуту
 					continue
 				}
+
 				pos := fset.Position(nd.Pos())
 				it.SourceFile = pos.Filename
 				it.SourceLine = pos.Line
@@ -685,20 +696,32 @@ func parseGoDocs(root string) []DocItem {
 				} else {
 					it.GoSymbol = nd.Name.Name
 				}
+
+				// Автовытягивание HandlerMeta (BodyParser/Status/JSON)
+				meta := inferHandlerMeta(nd)
+				if it.RequestType == "" && meta.RequestType != "" {
+					it.RequestType = meta.RequestType
+				}
+				if it.ResponseType == "" && meta.ResponseType != "" {
+					it.ResponseType = meta.ResponseType
+				}
+				if len(it.Statuses) == 0 && len(meta.Statuses) > 0 {
+					it.Statuses = meta.Statuses
+				}
+
+				// Если это service/repo/endpoint — соберём предварительный список вызовов
+				if strings.EqualFold(it.Section, "endpoint") ||
+					strings.EqualFold(it.Section, "service") ||
+					strings.EqualFold(it.Section, "repo") {
+					if info, ok := funcs[it.GoSymbol]; ok {
+						it.Extra["raw.calls"] = strings.Join(info.Calls, ", ")
+					}
+				}
+
 				out = append(out, *it)
 
 			case *ast.GenDecl:
-				// (1) Докблок над самим объявлением (может описывать пакетные константы/типы)
-				if nd.Doc != nil {
-					if it := makeDocItemFromCommentBlock(nd.Doc.Text()); it != nil {
-						pos := fset.Position(nd.Pos())
-						it.SourceFile = pos.Filename
-						it.SourceLine = pos.Line
-						it.GoSymbol = nd.Tok.String()
-						out = append(out, *it)
-					}
-				}
-				// (2) Спецификации в объявлении: интересуют struct-типы с @doc.section:model
+				// модели (@doc.section:model)
 				for _, spec := range nd.Specs {
 					ts, ok := spec.(*ast.TypeSpec)
 					if !ok {
@@ -708,12 +731,10 @@ func parseGoDocs(root string) []DocItem {
 					if !ok {
 						continue
 					}
-					// читаем докблок для конкретного type (если есть)
 					var it *DocItem
 					if nd.Doc != nil {
 						it = makeDocItemFromCommentBlock(nd.Doc.Text())
 					}
-					// если дока висит не на GenDecl, но на самом TypeSpec — тоже подхватим
 					if it == nil && ts.Doc != nil {
 						it = makeDocItemFromCommentBlock(ts.Doc.Text())
 					}
@@ -734,29 +755,21 @@ func parseGoDocs(root string) []DocItem {
 							Name:        ts.Name.Name,
 						}
 
-						// поля структуры
 						for _, f := range st.Fields.List {
-							// имя поля
 							var fieldName string
 							if len(f.Names) > 0 {
 								fieldName = f.Names[0].Name
 							} else {
-								// анонимные/embedded можно обработать отдельно (TODO)
 								continue
 							}
-							// тип поля
 							fType := exprString(f.Type)
-
-							// теги
 							jsonTag := getTagValue(f, "json")
 							dbTag := getTagValue(f, "db")
 							if dbTag == "" {
-								dbTag = getTagValue(f, "sqlc") // на случай sqlc
+								dbTag = getTagValue(f, "sqlc")
 							}
 							validate := splitCSV(getTagValue(f, "validate"))
 							docTags := splitCSV(getTagValue(f, "doc"))
-
-							// комментарий над полем
 							var comment string
 							if f.Doc != nil {
 								comment = strings.TrimSpace(f.Doc.Text())
@@ -774,7 +787,6 @@ func parseGoDocs(root string) []DocItem {
 								Comment:  oneLine(comment),
 							})
 						}
-
 						collectedModels = append(collectedModels, m)
 					}
 				}
@@ -782,13 +794,24 @@ func parseGoDocs(root string) []DocItem {
 		}
 	}
 
-	// сортировка для детерминизма
+	// сортировка
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Section == out[j].Section {
 			return out[i].ID < out[j].ID
 		}
 		return out[i].Section < out[j].Section
 	})
+	return out
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
 	return out
 }
 
@@ -823,7 +846,6 @@ func makeDocItemFromCommentBlock(text string) *DocItem {
 			buf.WriteString("\n")
 		} else {
 			if lastKey != "" {
-				// часть многострочного значения
 				if line == "" {
 					flush()
 				} else {
@@ -856,62 +878,355 @@ func makeDocItemFromCommentBlock(text string) *DocItem {
 		it.Errors = splitCSV(e)
 	}
 
-	// положим все ключи, которые не распознали, в Extra
 	for k, v := range m {
 		switch k {
 		case "section", "id", "summary", "details", "tags", "errors", "example", "repo.query", "service.usecase":
-			// пропускаем — уже положили в фиксированные поля
 		default:
 			it.Extra[k] = v
 		}
 	}
-
 	return it
 }
 
-func exprString(e ast.Expr) string {
-	switch v := e.(type) {
-	case *ast.Ident:
-		return v.Name
-	case *ast.StarExpr:
-		return "*" + exprString(v.X)
-	case *ast.SelectorExpr:
-		return exprString(v.X) + "." + v.Sel.Name
-	case *ast.ArrayType:
-		return "[]" + exprString(v.Elt)
-	case *ast.MapType:
-		return "map[" + exprString(v.Key) + "]" + exprString(v.Value)
-	case *ast.InterfaceType:
-		return "interface{}"
-	default:
-		return fmt.Sprintf("%T", e)
+func mergeDocItems(dst, src *DocItem) {
+	if src.Summary != "" {
+		dst.Summary = src.Summary
+	}
+	if src.Details != "" {
+		dst.Details = src.Details
+	}
+	if src.Example != "" {
+		dst.Example = src.Example
+	}
+	if src.RepoQuery != "" {
+		dst.RepoQuery = src.RepoQuery
+	}
+	if src.ServiceUC != "" {
+		dst.ServiceUC = src.ServiceUC
+	}
+	dst.Tags = append(dst.Tags, src.Tags...)
+	dst.Errors = append(dst.Errors, src.Errors...)
+	if dst.Extra == nil {
+		dst.Extra = map[string]string{}
+	}
+	for k, v := range src.Extra {
+		if strings.TrimSpace(v) == "" {
+			continue
+		}
+		dst.Extra[k] = v
 	}
 }
 
-func splitCSV(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
+// ========================= HandlerMeta =========================
+
+type HandlerMeta struct {
+	RequestType  string
+	ResponseType string
+	Statuses     []int
+}
+
+func inferHandlerMeta(f *ast.FuncDecl) HandlerMeta {
+	var meta HandlerMeta
+	locals := map[string]string{}
+
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch nn := n.(type) {
+		case *ast.DeclStmt:
+			if gd, ok := nn.Decl.(*ast.GenDecl); ok && gd.Tok == token.VAR {
+				for _, s := range gd.Specs {
+					if vs, ok := s.(*ast.ValueSpec); ok {
+						typ := exprString(vs.Type)
+						for _, name := range vs.Names {
+							locals[name.Name] = typ
+						}
+					}
+				}
+			}
+		case *ast.AssignStmt:
+			if len(nn.Lhs) == 1 && len(nn.Rhs) == 1 {
+				lid, ok1 := nn.Lhs[0].(*ast.Ident)
+				cl, ok2 := nn.Rhs[0].(*ast.CompositeLit)
+				if ok1 && ok2 {
+					locals[lid.Name] = exprString(cl.Type)
+				}
+			}
+		case *ast.CallExpr:
+			sel, ok := nn.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			// BodyParser
+			if sel.Sel.Name == "BodyParser" && len(nn.Args) > 0 {
+				if u, ok := nn.Args[0].(*ast.UnaryExpr); ok && u.Op == token.AND {
+					if id, ok := u.X.(*ast.Ident); ok {
+						if t := locals[id.Name]; t != "" {
+							meta.RequestType = t
+						}
+					}
+				}
+			}
+			// Status
+			if sel.Sel.Name == "Status" && len(nn.Args) > 0 {
+				if bl, ok := nn.Args[0].(*ast.SelectorExpr); ok {
+					if id, ok2 := bl.X.(*ast.Ident); ok2 && id.Name == "fiber" {
+						if code := statusNameToCode(bl.Sel.Name); code > 0 {
+							meta.Statuses = append(meta.Statuses, code)
+						}
+					}
+				} else if bl2, ok := nn.Args[0].(*ast.BasicLit); ok && bl2.Kind == token.INT {
+					if v, err := strconv.Atoi(bl2.Value); err == nil {
+						meta.Statuses = append(meta.Statuses, v)
+					}
+				}
+			}
+			// JSON
+			if sel.Sel.Name == "JSON" && len(nn.Args) > 0 {
+				switch a := nn.Args[0].(type) {
+				case *ast.Ident:
+					if t := locals[a.Name]; t != "" {
+						meta.ResponseType = t
+					}
+				case *ast.CompositeLit:
+					meta.ResponseType = exprString(a.Type)
+				}
+			}
+		}
+		return true
+	})
+
+	// uniq statuses
+	uniq := map[int]bool{}
+	var out []int
+	for _, s := range meta.Statuses {
+		if s <= 0 {
+			continue
+		}
+		if !uniq[s] {
+			out = append(out, s)
+			uniq[s] = true
 		}
 	}
-	return out
+	meta.Statuses = out
+	return meta
 }
 
-// ---------- Markdown render ----------
+func statusNameToCode(name string) int {
+	switch name {
+	case "StatusOK":
+		return 200
+	case "StatusCreated":
+		return 201
+	case "StatusNoContent":
+		return 204
+	case "StatusBadRequest":
+		return 400
+	case "StatusUnauthorized":
+		return 401
+	case "StatusForbidden":
+		return 403
+	case "StatusNotFound":
+		return 404
+	case "StatusConflict":
+		return 409
+	case "StatusInternalServerError":
+		return 500
+	default:
+		return 0
+	}
+}
+
+// ========================= Fiber routes =========================
+
+func parseFiberRoutes(root string) []Route {
+	var routes []Route
+	fset := token.NewFileSet()
+
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		if !strings.Contains(path, "router") && !strings.Contains(path, "route") {
+			// грубый фильтр — можно расширить
+			return nil
+		}
+		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.AllErrors)
+		if err != nil {
+			return nil
+		}
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			mName := sel.Sel.Name
+			if !map[string]bool{
+				"Get":    true,
+				"Post":   true,
+				"Put":    true,
+				"Delete": true,
+				"Patch":  true,
+			}[mName] {
+				return true
+			}
+			if len(call.Args) < 2 {
+				return true
+			}
+			// path
+			lit, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			pathVal := strings.Trim(lit.Value, `"`)
+
+			auth := false
+			handlerSym := ""
+
+			switch a := call.Args[1].(type) {
+			case *ast.CallExpr:
+				if sel2, ok := a.Fun.(*ast.SelectorExpr); ok &&
+					strings.Contains(strings.ToLower(exprString(sel2.X)), "middleware") &&
+					strings.Contains(strings.ToLower(sel2.Sel.Name), "jwt") {
+					auth = true
+					if len(a.Args) > 0 {
+						handlerSym = exprString(a.Args[0])
+					}
+				}
+			default:
+				handlerSym = exprString(a)
+			}
+
+			pos := fset.Position(call.Pos())
+			routes = append(routes, Route{
+				Method:     strings.ToUpper(mName),
+				Path:       pathVal,
+				Auth:       auth,
+				File:       pos.Filename,
+				Line:       pos.Line,
+				HandlerSym: handlerSym,
+			})
+			return true
+		})
+		return nil
+	})
+
+	return routes
+}
+
+func attachRoutes(docs []DocItem, routes []Route) {
+	for i := range docs {
+		if !strings.EqualFold(docs[i].Section, "endpoint") {
+			continue
+		}
+		gs := docs[i].GoSymbol // например: (*userHandler).Authenticate
+		// match by method name suffix
+		name := gs
+		if idx := strings.LastIndex(gs, "."); idx >= 0 {
+			name = gs[idx+1:]
+			name = strings.TrimSuffix(name, ")")
+		}
+		for _, r := range routes {
+			// handlerSym может быть client.GenerateOneLinkHandler — содержится ли имя?
+			if strings.Contains(r.HandlerSym, name) {
+				docs[i].Route = &r
+				// auth из @doc.auth имеет приоритет
+				if docs[i].Extra["auth"] == "" && r.Auth {
+					docs[i].Extra["auth"] = "required"
+				}
+				break
+			}
+		}
+	}
+}
+
+// ========================= Resolve call graph =========================
+
+func resolveCallGraph(docs []DocItem, funcs map[string]FuncDeclInfo) {
+	// построим быстрый индекс DocItem по GoSymbol и по короткому имени
+	bySym := map[string]*DocItem{}
+	byShort := map[string]*DocItem{}
+	for i := range docs {
+		di := &docs[i]
+		if di.GoSymbol != "" {
+			bySym[di.GoSymbol] = di
+			// короткое имя
+			short := di.GoSymbol
+			if idx := strings.LastIndex(short, "."); idx >= 0 {
+				short = short[idx+1:]
+				short = strings.TrimSuffix(short, ")")
+			}
+			if short != "" {
+				byShort[short] = di
+			}
+		}
+	}
+
+	for i := range docs {
+		di := &docs[i]
+		if !(strings.EqualFold(di.Section, "endpoint") ||
+			strings.EqualFold(di.Section, "service") ||
+			strings.EqualFold(di.Section, "repo")) {
+			continue
+		}
+		info, ok := funcs[di.GoSymbol]
+		if !ok {
+			continue
+		}
+		// пройдём сырые calls и попробуем сопоставить
+		seen := map[string]bool{}
+		for _, raw := range info.Calls {
+			// возьмём правую часть селектора как имя
+			name := raw
+			if idx := strings.LastIndex(name, "."); idx >= 0 {
+				name = name[idx+1:]
+			}
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			var target *DocItem
+			if t, ok := byShort[name]; ok {
+				target = t
+			} else if t, ok := bySym[name]; ok {
+				target = t
+			}
+			human := raw
+			if target != nil {
+				human = fmt.Sprintf("%s → %s", raw, safeTitle(target.ID, target.Summary))
+			}
+			if !seen[human] {
+				di.Calls = append(di.Calls, human)
+				seen[human] = true
+			}
+		}
+	}
+}
+
+// ========================= Markdown =========================
+
 func renderMarkdown(tables []Table, docs []DocItem, models []Model, withMermaid bool) []byte {
 	var md bytes.Buffer
 	md.WriteString("# Project Documentation (auto)\n\n")
 
-	// Sections from @doc
-	writeDocSection(&md, docs, "endpoint", "## Endpoints")
-	writeDocSection(&md, docs, "service", "## Services & Use cases")
-	writeDocSection(&md, docs, "repo", "## Repositories & Queries")
-	writeDocSection(&md, docs, "domain", "## Domain Notes")
+	// TOC
+	md.WriteString("- [Endpoints](#endpoints)\n")
+	md.WriteString("- [Services & Use cases](#services--use-cases)\n")
+	md.WriteString("- [Repositories & Queries](#repositories--queries)\n")
+	md.WriteString("- [Models](#models)\n")
+	md.WriteString("- [Call Graph](#call-graph)\n")
+	md.WriteString("- [Database Schema (from migrations)](#database-schema-from-migrations)\n\n")
 
-	// Models
+	writeDocSection(&md, docs, "endpoint", "## Endpoints", true)
+	writeDocSection(&md, docs, "service", "## Services & Use cases", false)
+	writeDocSection(&md, docs, "repo", "## Repositories & Queries", false)
+	writeDocSection(&md, docs, "domain", "## Domain Notes", false)
+
 	writeModelsSection(&md, models, tables)
+	writeCallGraph(&md, docs)
 
 	// DB schema
 	md.WriteString("\n## Database Schema (from migrations)\n\n")
@@ -952,14 +1267,12 @@ func renderMarkdown(tables []Table, docs []DocItem, models []Model, withMermaid 
 			for _, t := range tables {
 				fmt.Fprintf(&md, "  %s {\n", t.Name)
 				for _, c := range t.Columns {
-					// Mermaid типы условные
 					fmt.Fprintf(&md, "    %s %s\n", c.Type, c.Name)
 				}
 				md.WriteString("  }\n")
 			}
 			for _, t := range tables {
 				for _, fk := range t.Foreign {
-					// t ||--o{ fk.RefTable
 					fmt.Fprintf(&md, "  %s }o--|| %s : FK\n", t.Name, fk.RefTable)
 				}
 			}
@@ -970,6 +1283,110 @@ func renderMarkdown(tables []Table, docs []DocItem, models []Model, withMermaid 
 	return md.Bytes()
 }
 
+func nz(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func statusBadge(codes []int) string {
+	if len(codes) == 0 {
+		return "-"
+	}
+	var parts []string
+	for _, c := range codes {
+		icon := "✅"
+		switch {
+		case c >= 500:
+			icon = "🟥"
+		case c >= 400:
+			icon = "🟧"
+		case c >= 300:
+			icon = "🟨"
+		case c >= 200:
+			icon = "✅"
+		default:
+			icon = "⬜️"
+		}
+		parts = append(parts, fmt.Sprintf("%s %d", icon, c))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func writeDocSection(md *bytes.Buffer, docs []DocItem, want, title string, showRoutes bool) {
+	var items []DocItem
+	for _, d := range docs {
+		if strings.EqualFold(d.Section, want) {
+			items = append(items, d)
+		}
+	}
+	if len(items) == 0 {
+		return
+	}
+	md.WriteString(title + "\n\n")
+	for _, d := range items {
+		id := d.ID
+		if id == "" {
+			id = slug(d.Summary)
+		}
+		fmt.Fprintf(md, "### %s\n\n", safeTitle(id, d.Summary))
+
+		if showRoutes && d.Route != nil {
+			auth := ""
+			if strings.EqualFold(d.Extra["auth"], "required") || d.Route.Auth {
+				auth = " 🔒 _auth required_"
+			}
+			fmt.Fprintf(md, "`%s %s`%s\n\n", d.Route.Method, d.Route.Path, auth)
+		}
+
+		if len(d.Tags) > 0 {
+			fmt.Fprintf(md, "_Tags:_ %s\n\n", strings.Join(d.Tags, ", "))
+		}
+		if d.Summary != "" {
+			fmt.Fprintf(md, "**Summary:** %s\n\n", d.Summary)
+		}
+		if d.Details != "" {
+			md.WriteString(d.Details + "\n\n")
+		}
+		if d.RepoQuery != "" {
+			fmt.Fprintf(md, "**Repo query:** `%s`\n\n", d.RepoQuery)
+		}
+		if d.ServiceUC != "" {
+			fmt.Fprintf(md, "**Use case:** `%s`\n\n", d.ServiceUC)
+		}
+
+		// Request/Response/Statuses
+		if d.RequestType != "" || d.ResponseType != "" || len(d.Statuses) > 0 {
+			md.WriteString("| Request | Response | Statuses |\n|---|---|---|\n")
+			fmt.Fprintf(md, "| %s | %s | %s |\n\n",
+				nz(d.RequestType), nz(d.ResponseType), statusBadge(d.Statuses))
+		}
+
+		// curl
+		if showRoutes && d.Route != nil {
+			body := ""
+			if d.RequestType != "" {
+				body = ` -H 'Content-Type: application/json' -d '{...}'`
+			}
+			auth := ""
+			if strings.EqualFold(d.Extra["auth"], "required") || d.Route.Auth {
+				auth = " -H 'Authorization: Bearer <token>'"
+			}
+			ex := fmt.Sprintf("curl -X %s http://localhost:8080%s%s%s", d.Route.Method, d.Route.Path, auth, body)
+			md.WriteString("<details><summary>Example</summary>\n\n```\n" + ex + "\n```\n\n</details>\n\n")
+		} else if d.Example != "" {
+			md.WriteString("**Example**\n\n```\n" + d.Example + "\n```\n\n")
+		}
+
+		if len(d.Errors) > 0 {
+			fmt.Fprintf(md, "**Errors:** %s\n\n", strings.Join(d.Errors, ", "))
+		}
+		fmt.Fprintf(md, "_src: %s:%d (%s)_\n\n", shortPath(d.SourceFile), d.SourceLine, d.GoSymbol)
+	}
+}
+
 func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 	if len(models) == 0 {
 		return
@@ -978,7 +1395,7 @@ func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 
 	byTable := map[string]*Table{}
 	for i := range tables {
-		tt := tables[i] // copy for address
+		tt := tables[i]
 		byTable[tt.Name] = &tt
 	}
 
@@ -1034,61 +1451,28 @@ func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 	}
 }
 
-func nz(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "-"
-	}
-	return s
-}
-
-func writeDocSection(md *bytes.Buffer, docs []DocItem, want, title string) {
-	var items []DocItem
+func writeCallGraph(md *bytes.Buffer, docs []DocItem) {
+	md.WriteString("## Call Graph\n\n")
+	any := false
 	for _, d := range docs {
-		if strings.EqualFold(d.Section, want) {
-			items = append(items, d)
+		if len(d.Calls) == 0 {
+			continue
 		}
+		any = true
+		title := safeTitle(d.ID, d.Summary)
+		fmt.Fprintf(md, "### %s\n\n", title)
+		for _, c := range d.Calls {
+			fmt.Fprintf(md, "- %s\n", c)
+		}
+		md.WriteString("\n")
 	}
-	if len(items) == 0 {
-		return
-	}
-	md.WriteString(title + "\n\n")
-	for _, d := range items {
-		id := d.ID
-		if id == "" {
-			id = slug(d.Summary)
-		}
-		fmt.Fprintf(md, "### %s\n\n", safeTitle(id, d.Summary))
-		if len(d.Tags) > 0 {
-			fmt.Fprintf(md, "_Tags:_ %s\n\n", strings.Join(d.Tags, ", "))
-		}
-		if d.Summary != "" {
-			fmt.Fprintf(md, "**Summary:** %s\n\n", d.Summary)
-		}
-		if d.Details != "" {
-			md.WriteString(d.Details + "\n\n")
-		}
-		if d.RepoQuery != "" {
-			fmt.Fprintf(md, "**Repo query:** `%s`\n\n", d.RepoQuery)
-		}
-		if d.ServiceUC != "" {
-			fmt.Fprintf(md, "**Use case:** `%s`\n\n", d.ServiceUC)
-		}
-		if len(d.Errors) > 0 {
-			fmt.Fprintf(md, "**Errors:** %s\n\n", strings.Join(d.Errors, ", "))
-		}
-		if d.Example != "" {
-			md.WriteString("**Example**\n\n```\n" + d.Example + "\n```\n\n")
-		}
-		fmt.Fprintf(md, "_src: %s:%d (%s)_\n\n", shortPath(d.SourceFile), d.SourceLine, d.GoSymbol)
+	if !any {
+		md.WriteString("_No calls collected_\n\n")
 	}
 }
 
 func shortPath(p string) string {
 	p = filepath.ToSlash(p)
-	if i := strings.Index(p, "/"); i >= 0 {
-		return p
-	}
 	return p
 }
 
@@ -1109,65 +1493,58 @@ func safeTitle(id, summary string) string {
 	return id
 }
 
-func getTagValue(f *ast.Field, key string) string {
-	if f.Tag == nil {
-		return ""
-	}
-	raw := strings.Trim(f.Tag.Value, "`")
-	// простая выборка по ключу
-	for _, part := range strings.Split(raw, " ") {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, key+":") {
-			val := strings.TrimPrefix(part, key+":")
-			val = strings.Trim(val, `"`)
-			return val
-		}
-	}
-	return ""
-}
+// ========================= OpenAPI (minimal) =========================
 
-func cleanJSONName(tag, fallback string) string {
-	if tag == "" {
-		return fallback
+func writeOpenAPI(path string, docs []DocItem) error {
+	// сгруппируем по пути
+	type op struct {
+		Method string
+		Item   *DocItem
 	}
-	name := strings.Split(tag, ",")[0]
-	if name == "" || name == "-" {
-		return "-"
-	}
-	return name
-}
+	paths := map[string][]op{}
 
-func oneLine(s string) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	return strings.Join(strings.Fields(s), " ")
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-func sanitizeSQL(s string) string {
-	lines := strings.Split(s, "\n")
-	out := make([]string, 0, len(lines))
-	for _, ln := range lines {
-		t := strings.TrimSpace(ln)
-
-		// пропускаем служебные директивы goose
-		if strings.HasPrefix(t, "-- +goose") {
+	for i := range docs {
+		di := &docs[i]
+		if !strings.EqualFold(di.Section, "endpoint") || di.Route == nil {
 			continue
 		}
-
-		// режем построчные комментарии
-		if idx := strings.Index(ln, "--"); idx >= 0 {
-			ln = ln[:idx]
-		}
-
-		out = append(out, ln)
+		paths[di.Route.Path] = append(paths[di.Route.Path], op{Method: strings.ToLower(di.Route.Method), Item: di})
 	}
-	return strings.Join(out, "\n")
+
+	var b strings.Builder
+	b.WriteString("openapi: 3.0.3\ninfo:\n  title: Project API\n  version: 1.0.0\npaths:\n")
+	for p, ops := range paths {
+		fmt.Fprintf(&b, "  %s:\\n", p)
+		for _, o := range ops {
+			sum := o.Item.Summary
+			if sum == "" {
+				sum = o.Item.ID
+			}
+			fmt.Fprintf(&b, "    %s:\n      summary: %q\n", o.Method, sum)
+			// security
+			if strings.EqualFold(o.Item.Extra["auth"], "required") || (o.Item.Route != nil && o.Item.Route.Auth) {
+				b.WriteString("      security:\n        - bearerAuth: []\n")
+			}
+			// responses
+			b.WriteString("      responses:\n")
+			ok := 200
+			for _, s := range o.Item.Statuses {
+				if s >= 200 && s < 300 {
+					ok = s
+					break
+				}
+			}
+			fmt.Fprintf(&b, "        \"%d\": { description: \"OK\" }\n", ok)
+			for _, e := range o.Item.Errors {
+				ee := strings.TrimSpace(e)
+				if ee == "" {
+					continue
+				}
+				fmt.Fprintf(&b, "        \"%s\": { description: \"error\" }\n", ee)
+			}
+		}
+	}
+	b.WriteString("components:\n  securitySchemes:\n    bearerAuth:\n      type: http\n      scheme: bearer\n      bearerFormat: JWT\n")
+
+	return os.WriteFile(path, []byte(b.String()), 0644)
 }
