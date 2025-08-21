@@ -177,7 +177,8 @@ func main() {
 	resolveCallGraph(docs, funcs)
 
 	// 7) Построим рекурсивные потоки для ручек
-	graphs := buildCallGraphs(docs, funcs)
+	graphs := buildCallGraphs(docs)
+	_ = writeFlowHTML("flows.html", graphs)
 
 	// 8) Markdown
 	md := renderMarkdown(tables, docs, collectedModels, *emitMermaid, graphs)
@@ -1220,154 +1221,100 @@ type CallGraph struct {
 type CGNode struct{ ID, Label string }
 type CGEdge struct{ From, To, Label string }
 
-func buildCallGraphs(docs []DocItem, funcs map[string]FuncDeclInfo) []CallGraph {
-	// индексы
-	bySym := map[string]*DocItem{}
+func buildCallGraphs(docs []DocItem) []CallGraph {
+	// Индексы для поиска целей по короткому имени
 	byShort := map[string]*DocItem{}
 	for i := range docs {
-		di := &docs[i]
-		if di.GoSymbol == "" {
+		if docs[i].GoSymbol == "" {
 			continue
 		}
-		bySym[di.GoSymbol] = di
-		short := di.GoSymbol
+		short := docs[i].GoSymbol
 		if idx := strings.LastIndex(short, "."); idx >= 0 {
 			short = short[idx+1:]
 			short = strings.TrimSuffix(short, ")")
 		}
-		byShort[short] = di
-	}
-
-	// вспомогательные
-	nextDocByRawCall := func(raw string) *DocItem {
-		// raw может быть "uh.userService.SelectUser" -> берём правую часть
-		name := raw
-		if idx := strings.LastIndex(name, "."); idx >= 0 {
-			name = name[idx+1:]
+		if short != "" {
+			byShort[short] = &docs[i]
 		}
-		if d := byShort[name]; d != nil {
-			return d
-		}
-		if d := bySym[name]; d != nil {
-			return d
-		}
-		return nil
 	}
 
 	var graphs []CallGraph
 
 	for i := range docs {
-		di := &docs[i]
-		if !strings.EqualFold(di.Section, "endpoint") {
+		d := &docs[i]
+		if !strings.EqualFold(d.Section, "endpoint") {
 			continue
 		}
-		start := di.GoSymbol
-		info, ok := funcs[start]
-		if !ok {
-			continue
-		}
-		_ = info
 
-		// подготавливаем граф
-		var g CallGraph
-		title := safeTitle(di.ID, di.Summary)
-		if di.Route != nil {
-			title = fmt.Sprintf("%s — %s %s", title, di.Route.Method, di.Route.Path)
+		// Заголовок
+		title := safeTitle(d.ID, d.Summary)
+		if d.Route != nil {
+			title = fmt.Sprintf("%s — %s %s", title, d.Route.Method, d.Route.Path)
 		}
-		g.Title = title
 
-		// узлы/рёбра с автогенерацией id
-		nodeID := map[string]string{} // label -> id
-		idSeq := 0
-		getID := func(label string) string {
-			if id, ok := nodeID[label]; ok {
-				return id
+		// Узлы
+		nodes := []CGNode{}
+		edges := []CGEdge{}
+		ascii := []string{}
+
+		// Стартовый узел — эндпоинт
+		startLabel := title
+		startID := makeNodeID(startLabel, 0)
+		nodes = append(nodes, CGNode{ID: startID, Label: startLabel})
+		ascii = append(ascii, "[Endpoint] "+startLabel)
+
+		// Пройдём по d.Calls (они уже обогащены именами через resolveCallGraph)
+		prevID := startID
+		for idx, c := range d.Calls {
+			// c вида: "uh.userService.SelectUser → svc-user-select — Найти администратора по username"
+			label := c
+			// Подрежем, делая подпись компактнее
+			if j := strings.Index(c, " → "); j >= 0 {
+				label = c[j+3:]
 			}
-			idSeq++
-			id := fmt.Sprintf("N%d", idSeq)
-			nodeID[label] = id
-			g.Nodes = append(g.Nodes, CGNode{ID: id, Label: label})
-			return id
-		}
-		addEdge := func(fromLabel, toLabel, lbl string) {
-			a := getID(fromLabel)
-			b := getID(toLabel)
-			g.Edges = append(g.Edges, CGEdge{From: a, To: b, Label: lbl})
-		}
+			nodeID := makeNodeID(label, idx+1)
+			nodes = append(nodes, CGNode{ID: nodeID, Label: label})
+			edges = append(edges, CGEdge{From: prevID, To: nodeID, Label: ""})
+			prevID = nodeID
+			ascii = append(ascii, "  → "+label)
 
-		// стартовая подпись
-		startLabel := start
-		if di.Route != nil {
-			startLabel = fmt.Sprintf("%s %s", di.Route.Method, di.Route.Path)
-		}
-		getID(startLabel)
-
-		// DFS с ограничением глубины и фильтром шума
-		type frame struct {
-			Sym   string
-			Label string
-			Depth int
-		}
-		stack := []frame{{Sym: start, Label: startLabel, Depth: 0}}
-		visited := map[string]bool{}
-
-		var ascii []string
-		ascii = append(ascii, fmt.Sprintf("[Endpoint] %s", startLabel))
-
-		for len(stack) > 0 {
-			cur := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-
-			if visited[cur.Sym] && cur.Depth > 0 {
-				continue
-			}
-			visited[cur.Sym] = true
-			fi, ok := funcs[cur.Sym]
-			if !ok {
-				continue
-			}
-
-			// соберём отсортированные "дети" вызовы
-			var children []string
-			seenRaw := map[string]bool{}
-			for _, raw := range fi.Calls {
-				if seenRaw[raw] || isNoiseCall(raw) {
-					continue
+			// Если целевой DocItem — репозиторий и в нём есть SQL, добавим узел SQL
+			// Мы можем «угадать» это по ключевым словам
+			lower := strings.ToLower(label)
+			isRepo := strings.Contains(lower, "repo") || strings.Contains(lower, "select") || strings.Contains(lower, "insert") || strings.Contains(lower, "update") || strings.Contains(lower, "delete")
+			if isRepo {
+				// Найдём оригинальный DocItem (если есть)
+				// Берём короткое имя (последнее слово до " — "):
+				short := label
+				if k := strings.Index(short, " — "); k >= 0 {
+					short = short[:k]
 				}
-				seenRaw[raw] = true
-				children = append(children, raw)
-			}
-			sort.Strings(children)
-
-			for j := len(children) - 1; j >= 0; j-- { // в стек в обратном, чтобы идти сверху вниз
-				raw := children[j]
-				if d := nextDocByRawCall(raw); d != nil {
-					lbl := shortFuncName(d.GoSymbol)
-					addEdge(cur.Label, lbl, "")
-					if cur.Depth < 6 { // ограничение глубины
-						stack = append(stack, frame{Sym: d.GoSymbol, Label: lbl, Depth: cur.Depth + 1})
-					}
-					ascii = append(ascii, fmt.Sprintf("%s→ %s", strings.Repeat("  ", cur.Depth+1), lbl))
-
-					// если repo — добавим SQL как лист
-					if strings.EqualFold(d.Section, "repo") && strings.TrimSpace(d.RepoQuery) != "" {
-						sqlLabel := "SQL: " + trimSQL(d.RepoQuery, 80)
-						addEdge(lbl, sqlLabel, "")
-						ascii = append(ascii, fmt.Sprintf("%s→ %s", strings.Repeat("  ", cur.Depth+2), sqlLabel))
-					}
-				} else {
-					// библиотеки (whitelist)
-					if isLibInteresting(raw) {
-						lbl := raw
-						addEdge(cur.Label, lbl, "")
-						ascii = append(ascii, fmt.Sprintf("%s→ %s", strings.Repeat("  ", cur.Depth+1), lbl))
+				// иногда в label попадает id — можно попробовать мэпом byShort
+				if di, ok := byShort[strings.TrimSpace(short)]; ok {
+					if strings.TrimSpace(di.RepoQuery) != "" {
+						sqlLab := "SQL: " + di.RepoQuery
+						sqlID := makeNodeID(sqlLab, idx+1000)
+						nodes = append(nodes, CGNode{ID: sqlID, Label: sqlLab})
+						edges = append(edges, CGEdge{From: nodeID, To: sqlID, Label: ""})
+						ascii = append(ascii, "      → "+sqlLab)
 					}
 				}
 			}
 		}
 
-		g.ASCII = ascii
-		graphs = append(graphs, g)
+		// На всякий случай — если граф пустой (бывает), добавим заглушку
+		if len(nodes) == 1 && len(edges) == 0 {
+			dummyID := makeNodeID("No further calls", 9999)
+			nodes = append(nodes, CGNode{ID: dummyID, Label: "No further calls"})
+			edges = append(edges, CGEdge{From: startID, To: dummyID, Label: ""})
+		}
+
+		graphs = append(graphs, CallGraph{
+			Title: title,
+			ASCII: ascii,
+			Nodes: nodes,
+			Edges: edges,
+		})
 	}
 
 	return graphs
@@ -1531,83 +1478,6 @@ func statusBadge(codes []int) string {
 	return strings.Join(parts, ", ")
 }
 
-func writeDocSection(md *bytes.Buffer, docs []DocItem, want, title string, showRoutes bool) {
-	var items []DocItem
-	for _, d := range docs {
-		if strings.EqualFold(d.Section, want) {
-			items = append(items, d)
-		}
-	}
-	if len(items) == 0 {
-		return
-	}
-	md.WriteString(title + "\n\n")
-	for idx, d := range items {
-		id := d.ID
-		if id == "" {
-			id = slug(d.Summary)
-		}
-		fmt.Fprintf(md, "### %s\n\n", safeTitle(id, d.Summary))
-
-		if showRoutes && d.Route != nil {
-			auth := ""
-			if strings.EqualFold(d.Extra["auth"], "required") || d.Route.Auth {
-				auth = " 🔒 _auth required_"
-			}
-			fmt.Fprintf(md, "`%s %s`%s\n\n", d.Route.Method, d.Route.Path, auth)
-		}
-
-		if len(d.Tags) > 0 {
-			fmt.Fprintf(md, "_Tags:_ %s\n\n", strings.Join(d.Tags, ", "))
-		}
-		if d.Summary != "" {
-			fmt.Fprintf(md, "**Summary:** %s\n\n", d.Summary)
-		}
-		if d.Details != "" {
-			md.WriteString(d.Details + "\n\n")
-		}
-		if d.RepoQuery != "" {
-			fmt.Fprintf(md, "**Repo query:** `%s`\n\n", d.RepoQuery)
-		}
-		if d.ServiceUC != "" {
-			fmt.Fprintf(md, "**Use case:** `%s`\n\n", d.ServiceUC)
-		}
-
-		// Request/Response/Statuses
-		if d.RequestType != "" || d.ResponseType != "" || len(d.Statuses) > 0 {
-			md.WriteString("| Request | Response | Statuses |\n|---|---|---|\n")
-			fmt.Fprintf(md, "| %s | %s | %s |\n\n",
-				nz(d.RequestType), nz(d.ResponseType), statusBadge(d.Statuses))
-		}
-
-		// curl
-		if showRoutes && d.Route != nil {
-			body := ""
-			if d.RequestType != "" {
-				body = ` -H 'Content-Type: application/json' -d '{...}'`
-			}
-			auth := ""
-			if strings.EqualFold(d.Extra["auth"], "required") || d.Route.Auth {
-				auth = " -H 'Authorization: Bearer <token>'"
-			}
-			ex := fmt.Sprintf("curl -X %s http://localhost:8080%s%s%s", d.Route.Method, d.Route.Path, auth, body)
-			md.WriteString("<details><summary>Example</summary>\n\n```\n" + ex + "\n```\n\n</details>\n\n")
-		} else if d.Example != "" {
-			md.WriteString("**Example**\n\n```\n" + d.Example + "\n```\n\n")
-		}
-
-		if len(d.Errors) > 0 {
-			fmt.Fprintf(md, "**Errors:** %s\n\n", strings.Join(d.Errors, ", "))
-		}
-		fmt.Fprintf(md, "_src: %s:%d (%s)_\n\n", shortPath(d.SourceFile), d.SourceLine, d.GoSymbol)
-
-		// визуальный разделитель между айтемами
-		if idx != len(items)-1 {
-			md.WriteString("---\n\n")
-		}
-	}
-}
-
 func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 	if len(models) == 0 {
 		return
@@ -1620,7 +1490,7 @@ func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 		byTable[tt.Name] = &tt
 	}
 
-	for idx, m := range models {
+	for _, m := range models {
 		title := m.ID
 		if m.Summary != "" {
 			title += " — " + m.Summary
@@ -1650,16 +1520,18 @@ func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 			fmt.Fprintf(md, "**Permissions:** %s\n\n", m.Permissions)
 		}
 
-		writeModelTable(md, m)
+		// Упрощённая таблица
+		md.WriteString("| Field | JSON | DB | Type |\n|---|---|---|---|\n")
+		for _, f := range m.Fields {
+			fmt.Fprintf(md, "| %s | %s | %s | %s |\n",
+				f.Name, nz(f.JSON), nz(f.DB), f.Type)
+		}
+		md.WriteString("\n")
 
 		if m.Example != "" {
 			md.WriteString("**Example**\n\n```\n" + m.Example + "\n```\n\n")
 		}
 		fmt.Fprintf(md, "_src: %s:%d (type %s)_\n\n", shortPath(m.SourceFile), m.SourceLine, m.Name)
-
-		if idx != len(models)-1 {
-			md.WriteString("---\n\n")
-		}
 	}
 }
 
@@ -1831,10 +1703,28 @@ func renderCallGraphMarkdown(md *bytes.Buffer, g CallGraph) {
 	md.WriteString("```\n\n---\n\n")
 }
 
+// Делает безопасный для Mermaid ID (латиница/цифры/подчёркивание, начинается с буквы)
+func makeNodeID(label string, salt int) string {
+	s := strings.ToLower(label)
+	// Убираем всё, кроме [a-z0-9_]
+	s = regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(s, "_")
+	s = strings.Trim(s, "_")
+	if s == "" || s[0] >= '0' && s[0] <= '9' {
+		s = fmt.Sprintf("n_%s_%d", s, salt)
+	}
+	// ограничим длину
+	if len(s) > 48 {
+		s = s[:48]
+	}
+	return s
+}
+
+// Экранируем символы, которые ломают Mermaid-лейблы
 func escapeMermaid(s string) string {
-	// мермейд не любит обратные кавычки и «|»
 	s = strings.ReplaceAll(s, "|", "\\|")
 	s = strings.ReplaceAll(s, "`", "'")
+	s = strings.ReplaceAll(s, "]", "\\]")
+	s = strings.ReplaceAll(s, "[", "\\[")
 	return s
 }
 
@@ -1862,18 +1752,134 @@ mermaid.initialize({ startOnLoad: true, securityLevel:"loose", theme: "default" 
 		b.WriteString("<h2>")
 		b.WriteString(html.EscapeString(g.Title))
 		b.WriteString("</h2>\n<div class=\"mermaid\">\nflowchart TD\n")
-		for _, n := range g.Nodes {
-			fmt.Fprintf(&b, "  %s[%s]\n", n.ID, escapeMermaid(n.Label))
+
+		// Если вдруг нет узлов — добавим заглушку, чтобы не было Syntax error
+		if len(g.Nodes) == 0 {
+			b.WriteString("  n0[No data]\n")
+		} else {
+			for _, n := range g.Nodes {
+				id := n.ID
+				if id == "" {
+					id = makeNodeID(n.Label, 0)
+				}
+				fmt.Fprintf(&b, "  %s[%s]\n", id, escapeMermaid(n.Label))
+			}
 		}
 		for _, e := range g.Edges {
+			from := e.From
+			to := e.To
+			if from == "" || to == "" {
+				continue
+			}
 			if e.Label != "" {
-				fmt.Fprintf(&b, "  %s -->|%s| %s\n", e.From, escapeMermaid(e.Label), e.To)
+				fmt.Fprintf(&b, "  %s -->|%s| %s\n", from, escapeMermaid(e.Label), to)
 			} else {
-				fmt.Fprintf(&b, "  %s --> %s\n", e.From, e.To)
+				fmt.Fprintf(&b, "  %s --> %s\n", from, to)
 			}
 		}
 		b.WriteString("\n</div>\n<hr/>\n")
 	}
 	b.WriteString("</body></html>")
 	return os.WriteFile(path, []byte(b.String()), 0644)
+}
+
+func writeDocSection(md *bytes.Buffer, docs []DocItem, want, title string, showRoutes bool) {
+	var items []DocItem
+	for _, d := range docs {
+		if strings.EqualFold(d.Section, want) {
+			items = append(items, d)
+		}
+	}
+	if len(items) == 0 {
+		return
+	}
+	md.WriteString(title + "\n\n")
+	for idx, d := range items {
+		id := d.ID
+		if id == "" {
+			id = slug(d.Summary)
+		}
+		fmt.Fprintf(md, "### %s\n\n", safeTitle(id, d.Summary))
+
+		if showRoutes && d.Route != nil {
+			auth := ""
+			if strings.EqualFold(d.Extra["auth"], "required") || d.Route.Auth {
+				auth = " 🔒 _auth required_"
+			}
+			fmt.Fprintf(md, "`%s %s`%s\n\n", d.Route.Method, d.Route.Path, auth)
+		}
+
+		if len(d.Tags) > 0 {
+			fmt.Fprintf(md, "_Tags:_ %s\n\n", strings.Join(d.Tags, ", "))
+		}
+		if d.Summary != "" {
+			fmt.Fprintf(md, "**Summary:** %s\n\n", d.Summary)
+		}
+		if d.Details != "" {
+			md.WriteString(d.Details + "\n\n")
+		}
+		if d.RepoQuery != "" {
+			fmt.Fprintf(md, "**Repo query:** `%s`\n\n", d.RepoQuery)
+		}
+		if d.ServiceUC != "" {
+			fmt.Fprintf(md, "**Use case:** `%s`\n\n", d.ServiceUC)
+		}
+
+		// Request/Response/Statuses
+		if d.RequestType != "" || d.ResponseType != "" || len(d.Statuses) > 0 {
+			md.WriteString("| Request | Response | Statuses |\n|---|---|---|\n")
+			fmt.Fprintf(md, "| %s | %s | %s |\n\n",
+				nz(d.RequestType), nz(d.ResponseType), statusBadge(d.Statuses))
+		}
+
+		// curl
+		if showRoutes && d.Route != nil {
+			body := ""
+			if d.RequestType != "" {
+				body = ` -H 'Content-Type: application/json' -d '{...}'`
+			}
+			auth := ""
+			if strings.EqualFold(d.Extra["auth"], "required") || d.Route.Auth {
+				auth = " -H 'Authorization: Bearer <token)'"
+			}
+			ex := fmt.Sprintf("curl -X %s http://localhost:8080%s%s%s", d.Route.Method, d.Route.Path, auth, body)
+			md.WriteString("<details><summary>Example</summary>\n\n```\n" + ex + "\n```\n\n</details>\n\n")
+		} else if d.Example != "" {
+			md.WriteString("**Example**\n\n```\n" + d.Example + "\n```\n\n")
+		}
+
+		if len(d.Errors) > 0 {
+			fmt.Fprintf(md, "**Errors:** %s\n\n", strings.Join(d.Errors, ", "))
+		}
+		fmt.Fprintf(md, "_src: %s:%d (%s)_\n\n", shortPath(d.SourceFile), d.SourceLine, d.GoSymbol)
+
+		// ⬇️ ВСТАВЛЕННЫЙ БЛОК: компактная Mermaid-диаграмма прямо под ручкой
+		if strings.EqualFold(d.Section, "endpoint") && len(d.Calls) > 0 {
+			md.WriteString("\n```mermaid\nflowchart TD\n")
+			startLabel := safeTitle(d.ID, d.Summary)
+			if d.Route != nil {
+				startLabel = fmt.Sprintf("%s — %s %s", startLabel, d.Route.Method, d.Route.Path)
+			}
+			startID := makeNodeID(startLabel, 0)
+			fmt.Fprintf(md, "  %s[%s]\n", startID, escapeMermaid(startLabel))
+			prev := startID
+			for i, c := range d.Calls {
+				lab := c
+				if j := strings.Index(c, " → "); j >= 0 {
+					lab = c[j+3:]
+				}
+				nid := makeNodeID(lab, i+1)
+				fmt.Fprintf(md, "  %s[%s]\n", nid, escapeMermaid(lab))
+				fmt.Fprintf(md, "  %s --> %s\n", prev, nid)
+				prev = nid
+			}
+			md.WriteString("```\n\n")
+		}
+		// ⬆️ конец вставки
+
+		// визуальный разделитель между айтемами
+		if idx != len(items)-1 {
+			md.WriteString("---\n\n")
+		}
+	}
 }
