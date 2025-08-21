@@ -10,6 +10,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"html"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -148,7 +149,7 @@ type FuncDeclInfo struct {
 	Key     FuncKey
 	File    string
 	Line    int
-	Calls   []string // собранные имена вызовов (сырье)
+	Calls   []string // собранные имена вызовов (сырьё)
 	Comment string
 }
 
@@ -172,18 +173,26 @@ func main() {
 	// 5) Сопоставим роуты к endpoint-докам по имени хендлера
 	attachRoutes(docs, routes)
 
-	// 6) Обогатим call graph: сопоставим «сырье» к DocItem’ам
+	// 6) Обогатим call graph: сопоставим «сырьё» к DocItem’ам (плоский список)
 	resolveCallGraph(docs, funcs)
 
-	// 7) Markdown
-	md := renderMarkdown(tables, docs, collectedModels, *emitMermaid)
+	// 7) Построим рекурсивные потоки для ручек
+	graphs := buildCallGraphs(docs, funcs)
+
+	// 8) Markdown
+	md := renderMarkdown(tables, docs, collectedModels, *emitMermaid, graphs)
 	if err := os.WriteFile(*outFile, md, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", *outFile, err)
 		os.Exit(1)
 	}
 	fmt.Printf("Generated %s\n", *outFile)
 
-	// 8) OpenAPI (минимальный)
+	// 9) HTML-диаграммы
+	if err := writeFlowHTML("docs_flow.html", graphs); err == nil {
+		fmt.Println("Generated docs_flow.html")
+	}
+
+	// 10) OpenAPI (минимальный)
 	if strings.TrimSpace(*openapiOut) != "" {
 		if err := writeOpenAPI(*openapiOut, docs); err != nil {
 			fmt.Fprintf(os.Stderr, "openapi: %v\n", err)
@@ -588,19 +597,21 @@ func collectAllFunctions(root string) map[string]FuncDeclInfo {
 
 			// собрать "сырьё" вызовов
 			var calls []string
-			ast.Inspect(fd.Body, func(nn ast.Node) bool {
-				ce, ok := nn.(*ast.CallExpr)
-				if !ok {
+			if fd.Body != nil {
+				ast.Inspect(fd.Body, func(nn ast.Node) bool {
+					ce, ok := nn.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					switch fn := ce.Fun.(type) {
+					case *ast.SelectorExpr:
+						calls = append(calls, exprString(fn))
+					case *ast.Ident:
+						calls = append(calls, fn.Name)
+					}
 					return true
-				}
-				switch fn := ce.Fun.(type) {
-				case *ast.SelectorExpr:
-					calls = append(calls, exprString(fn))
-				case *ast.Ident:
-					calls = append(calls, fn.Name)
-				}
-				return true
-			})
+				})
+			}
 
 			funcs[key.String()] = FuncDeclInfo{
 				Key:   key,
@@ -675,6 +686,7 @@ func parseGoDocs(root string, funcs map[string]FuncDeclInfo) []DocItem {
 						if cg.Pos() >= nd.Body.Pos() && cg.End() <= nd.Body.End() {
 							if inner := makeDocItemFromCommentBlock(cg.Text()); inner != nil {
 								if it == nil {
+									// позволяем докам жить только внутри тела
 									it = inner
 								} else {
 									mergeDocItems(it, inner)
@@ -684,7 +696,6 @@ func parseGoDocs(root string, funcs map[string]FuncDeclInfo) []DocItem {
 					}
 				}
 				if it == nil {
-					// даже без @doc — попытаемся для endpoint вытянуть метаданные, если он будет сопоставлен по роуту
 					continue
 				}
 
@@ -709,7 +720,7 @@ func parseGoDocs(root string, funcs map[string]FuncDeclInfo) []DocItem {
 					it.Statuses = meta.Statuses
 				}
 
-				// Если это service/repo/endpoint — соберём предварительный список вызовов
+				// Для endpoint/service/repo — сохраним «сырьё» вызовов
 				if strings.EqualFold(it.Section, "endpoint") ||
 					strings.EqualFold(it.Section, "service") ||
 					strings.EqualFold(it.Section, "repo") {
@@ -1064,13 +1075,7 @@ func parseFiberRoutes(root string) []Route {
 				return true
 			}
 			mName := sel.Sel.Name
-			if !map[string]bool{
-				"Get":    true,
-				"Post":   true,
-				"Put":    true,
-				"Delete": true,
-				"Patch":  true,
-			}[mName] {
+			if !map[string]bool{"Get": true, "Post": true, "Put": true, "Delete": true, "Patch": true}[mName] {
 				return true
 			}
 			if len(call.Args) < 2 {
@@ -1143,7 +1148,7 @@ func attachRoutes(docs []DocItem, routes []Route) {
 	}
 }
 
-// ========================= Resolve call graph =========================
+// ========================= Resolve call graph (flat) =========================
 
 func resolveCallGraph(docs []DocItem, funcs map[string]FuncDeclInfo) {
 	// построим быстрый индекс DocItem по GoSymbol и по короткому имени
@@ -1153,7 +1158,6 @@ func resolveCallGraph(docs []DocItem, funcs map[string]FuncDeclInfo) {
 		di := &docs[i]
 		if di.GoSymbol != "" {
 			bySym[di.GoSymbol] = di
-			// короткое имя
 			short := di.GoSymbol
 			if idx := strings.LastIndex(short, "."); idx >= 0 {
 				short = short[idx+1:]
@@ -1176,10 +1180,8 @@ func resolveCallGraph(docs []DocItem, funcs map[string]FuncDeclInfo) {
 		if !ok {
 			continue
 		}
-		// пройдём сырые calls и попробуем сопоставить
 		seen := map[string]bool{}
 		for _, raw := range info.Calls {
-			// возьмём правую часть селектора как имя
 			name := raw
 			if idx := strings.LastIndex(name, "."); idx >= 0 {
 				name = name[idx+1:]
@@ -1206,9 +1208,223 @@ func resolveCallGraph(docs []DocItem, funcs map[string]FuncDeclInfo) {
 	}
 }
 
+// ========================= Build recursive call graphs =========================
+
+type CallGraph struct {
+	Title string   // "auth-authenticate — Аутентификация..."
+	ASCII []string // готовые строки ASCII-стека
+	Nodes []CGNode // для Mermaid
+	Edges []CGEdge
+}
+
+type CGNode struct{ ID, Label string }
+type CGEdge struct{ From, To, Label string }
+
+func buildCallGraphs(docs []DocItem, funcs map[string]FuncDeclInfo) []CallGraph {
+	// индексы
+	bySym := map[string]*DocItem{}
+	byShort := map[string]*DocItem{}
+	for i := range docs {
+		di := &docs[i]
+		if di.GoSymbol == "" {
+			continue
+		}
+		bySym[di.GoSymbol] = di
+		short := di.GoSymbol
+		if idx := strings.LastIndex(short, "."); idx >= 0 {
+			short = short[idx+1:]
+			short = strings.TrimSuffix(short, ")")
+		}
+		byShort[short] = di
+	}
+
+	// вспомогательные
+	nextDocByRawCall := func(raw string) *DocItem {
+		// raw может быть "uh.userService.SelectUser" -> берём правую часть
+		name := raw
+		if idx := strings.LastIndex(name, "."); idx >= 0 {
+			name = name[idx+1:]
+		}
+		if d := byShort[name]; d != nil {
+			return d
+		}
+		if d := bySym[name]; d != nil {
+			return d
+		}
+		return nil
+	}
+
+	var graphs []CallGraph
+
+	for i := range docs {
+		di := &docs[i]
+		if !strings.EqualFold(di.Section, "endpoint") {
+			continue
+		}
+		start := di.GoSymbol
+		info, ok := funcs[start]
+		if !ok {
+			continue
+		}
+		_ = info
+
+		// подготавливаем граф
+		var g CallGraph
+		title := safeTitle(di.ID, di.Summary)
+		if di.Route != nil {
+			title = fmt.Sprintf("%s — %s %s", title, di.Route.Method, di.Route.Path)
+		}
+		g.Title = title
+
+		// узлы/рёбра с автогенерацией id
+		nodeID := map[string]string{} // label -> id
+		idSeq := 0
+		getID := func(label string) string {
+			if id, ok := nodeID[label]; ok {
+				return id
+			}
+			idSeq++
+			id := fmt.Sprintf("N%d", idSeq)
+			nodeID[label] = id
+			g.Nodes = append(g.Nodes, CGNode{ID: id, Label: label})
+			return id
+		}
+		addEdge := func(fromLabel, toLabel, lbl string) {
+			a := getID(fromLabel)
+			b := getID(toLabel)
+			g.Edges = append(g.Edges, CGEdge{From: a, To: b, Label: lbl})
+		}
+
+		// стартовая подпись
+		startLabel := start
+		if di.Route != nil {
+			startLabel = fmt.Sprintf("%s %s", di.Route.Method, di.Route.Path)
+		}
+		getID(startLabel)
+
+		// DFS с ограничением глубины и фильтром шума
+		type frame struct {
+			Sym   string
+			Label string
+			Depth int
+		}
+		stack := []frame{{Sym: start, Label: startLabel, Depth: 0}}
+		visited := map[string]bool{}
+
+		var ascii []string
+		ascii = append(ascii, fmt.Sprintf("[Endpoint] %s", startLabel))
+
+		for len(stack) > 0 {
+			cur := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+
+			if visited[cur.Sym] && cur.Depth > 0 {
+				continue
+			}
+			visited[cur.Sym] = true
+			fi, ok := funcs[cur.Sym]
+			if !ok {
+				continue
+			}
+
+			// соберём отсортированные "дети" вызовы
+			var children []string
+			seenRaw := map[string]bool{}
+			for _, raw := range fi.Calls {
+				if seenRaw[raw] || isNoiseCall(raw) {
+					continue
+				}
+				seenRaw[raw] = true
+				children = append(children, raw)
+			}
+			sort.Strings(children)
+
+			for j := len(children) - 1; j >= 0; j-- { // в стек в обратном, чтобы идти сверху вниз
+				raw := children[j]
+				if d := nextDocByRawCall(raw); d != nil {
+					lbl := shortFuncName(d.GoSymbol)
+					addEdge(cur.Label, lbl, "")
+					if cur.Depth < 6 { // ограничение глубины
+						stack = append(stack, frame{Sym: d.GoSymbol, Label: lbl, Depth: cur.Depth + 1})
+					}
+					ascii = append(ascii, fmt.Sprintf("%s→ %s", strings.Repeat("  ", cur.Depth+1), lbl))
+
+					// если repo — добавим SQL как лист
+					if strings.EqualFold(d.Section, "repo") && strings.TrimSpace(d.RepoQuery) != "" {
+						sqlLabel := "SQL: " + trimSQL(d.RepoQuery, 80)
+						addEdge(lbl, sqlLabel, "")
+						ascii = append(ascii, fmt.Sprintf("%s→ %s", strings.Repeat("  ", cur.Depth+2), sqlLabel))
+					}
+				} else {
+					// библиотеки (whitelist)
+					if isLibInteresting(raw) {
+						lbl := raw
+						addEdge(cur.Label, lbl, "")
+						ascii = append(ascii, fmt.Sprintf("%s→ %s", strings.Repeat("  ", cur.Depth+1), lbl))
+					}
+				}
+			}
+		}
+
+		g.ASCII = ascii
+		graphs = append(graphs, g)
+	}
+
+	return graphs
+}
+
+func shortFuncName(goSym string) string {
+	if goSym == "" {
+		return ""
+	}
+	s := goSym
+	if i := strings.LastIndex(s, "/"); i >= 0 {
+		s = s[i+1:]
+	}
+	return s
+}
+
+func trimSQL(q string, n int) string {
+	qq := strings.Join(strings.Fields(q), " ")
+	if len(qq) <= n {
+		return qq
+	}
+	return qq[:n-1] + "…"
+}
+
+func isNoiseCall(raw string) bool {
+	r := raw
+	// отсекаем шум
+	noisePrefixes := []string{
+		"log.", "ctx.", "context.", "errors.", "fmt.", "time.", "os.",
+		"strconv.", "strings.", "bytes.", "json.", "sql.", "reflect.",
+		"rows.", "append", "len", "cap", "make", "copy", "panic", "recover",
+	}
+	for _, p := range noisePrefixes {
+		if strings.HasPrefix(r, p) {
+			return true
+		}
+	}
+	// часто в проекте: logger.With(...).Str(...).Msg(...), ctx.Status(...), ctx.JSON(...)
+	if strings.Contains(r, ".With") || strings.Contains(r, ".Msg") ||
+		strings.Contains(r, ".Status") || strings.Contains(r, ".JSON") || strings.Contains(r, ".BodyParser") {
+		return true
+	}
+	return false
+}
+
+func isLibInteresting(raw string) bool {
+	// подсветим крипто/джвт/хеш и т.п.
+	if strings.HasPrefix(raw, "bcrypt.") ||
+		strings.HasPrefix(raw, "jwt.") {
+		return true
+	}
+	return false
+}
+
 // ========================= Markdown =========================
 
-func renderMarkdown(tables []Table, docs []DocItem, models []Model, withMermaid bool) []byte {
+func renderMarkdown(tables []Table, docs []DocItem, models []Model, withMermaid bool, graphs []CallGraph) []byte {
 	var md bytes.Buffer
 	md.WriteString("# Project Documentation (auto)\n\n")
 
@@ -1226,7 +1442,7 @@ func renderMarkdown(tables []Table, docs []DocItem, models []Model, withMermaid 
 	writeDocSection(&md, docs, "domain", "## Domain Notes", false)
 
 	writeModelsSection(&md, models, tables)
-	writeCallGraph(&md, docs)
+	writeCallGraph(&md, graphs)
 
 	// DB schema
 	md.WriteString("\n## Database Schema (from migrations)\n\n")
@@ -1326,7 +1542,7 @@ func writeDocSection(md *bytes.Buffer, docs []DocItem, want, title string, showR
 		return
 	}
 	md.WriteString(title + "\n\n")
-	for _, d := range items {
+	for idx, d := range items {
 		id := d.ID
 		if id == "" {
 			id = slug(d.Summary)
@@ -1384,6 +1600,11 @@ func writeDocSection(md *bytes.Buffer, docs []DocItem, want, title string, showR
 			fmt.Fprintf(md, "**Errors:** %s\n\n", strings.Join(d.Errors, ", "))
 		}
 		fmt.Fprintf(md, "_src: %s:%d (%s)_\n\n", shortPath(d.SourceFile), d.SourceLine, d.GoSymbol)
+
+		// визуальный разделитель между айтемами
+		if idx != len(items)-1 {
+			md.WriteString("---\n\n")
+		}
 	}
 }
 
@@ -1399,7 +1620,7 @@ func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 		byTable[tt.Name] = &tt
 	}
 
-	for _, m := range models {
+	for idx, m := range models {
 		title := m.ID
 		if m.Summary != "" {
 			title += " — " + m.Summary
@@ -1429,8 +1650,53 @@ func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 			fmt.Fprintf(md, "**Permissions:** %s\n\n", m.Permissions)
 		}
 
-		md.WriteString("| Field | JSON | DB | Type | Constraints | Notes |\n|---|---|---|---|---|---|\n")
-		for _, f := range m.Fields {
+		writeModelTable(md, m)
+
+		if m.Example != "" {
+			md.WriteString("**Example**\n\n```\n" + m.Example + "\n```\n\n")
+		}
+		fmt.Fprintf(md, "_src: %s:%d (type %s)_\n\n", shortPath(m.SourceFile), m.SourceLine, m.Name)
+
+		if idx != len(models)-1 {
+			md.WriteString("---\n\n")
+		}
+	}
+}
+
+// динамическая таблица полей — без пустых колонок Constraints/Notes
+func writeModelTable(md *bytes.Buffer, m Model) {
+	hasDB, hasCons, hasNotes := false, false, false
+	for _, f := range m.Fields {
+		if nz(f.DB) != "-" {
+			hasDB = true
+		}
+		if strings.TrimSpace(strings.Join(f.Validate, ", ")) != "" || len(f.DocTags) > 0 {
+			hasCons = true
+		}
+		if nz(f.Comment) != "-" {
+			hasNotes = true
+		}
+	}
+	cols := []string{"Field", "JSON"}
+	if hasDB {
+		cols = append(cols, "DB")
+	}
+	cols = append(cols, "Type")
+	if hasCons {
+		cols = append(cols, "Constraints")
+	}
+	if hasNotes {
+		cols = append(cols, "Notes")
+	}
+	md.WriteString("| " + strings.Join(cols, " | ") + " |\n|" + strings.Repeat("---|", len(cols)) + "\n")
+
+	for _, f := range m.Fields {
+		row := []string{f.Name, nz(f.JSON)}
+		if hasDB {
+			row = append(row, nz(f.DB))
+		}
+		row = append(row, f.Type)
+		if hasCons {
 			cons := strings.Join(f.Validate, ", ")
 			if len(f.DocTags) > 0 {
 				if cons != "" {
@@ -1438,36 +1704,24 @@ func writeModelsSection(md *bytes.Buffer, models []Model, tables []Table) {
 				}
 				cons += strings.Join(f.DocTags, ", ")
 			}
-			fmt.Fprintf(md, "| %s | %s | %s | %s | %s | %s |\n",
-				f.Name, nz(f.JSON), nz(f.DB), f.Type, nz(cons), nz(f.Comment),
-			)
+			row = append(row, nz(cons))
 		}
-		md.WriteString("\n")
-
-		if m.Example != "" {
-			md.WriteString("**Example**\n\n```\n" + m.Example + "\n```\n\n")
+		if hasNotes {
+			row = append(row, nz(f.Comment))
 		}
-		fmt.Fprintf(md, "_src: %s:%d (type %s)_\n\n", shortPath(m.SourceFile), m.SourceLine, m.Name)
+		md.WriteString("| " + strings.Join(row, " | ") + " |\n")
 	}
+	md.WriteString("\n")
 }
 
-func writeCallGraph(md *bytes.Buffer, docs []DocItem) {
+func writeCallGraph(md *bytes.Buffer, graphs []CallGraph) {
 	md.WriteString("## Call Graph\n\n")
-	any := false
-	for _, d := range docs {
-		if len(d.Calls) == 0 {
-			continue
-		}
-		any = true
-		title := safeTitle(d.ID, d.Summary)
-		fmt.Fprintf(md, "### %s\n\n", title)
-		for _, c := range d.Calls {
-			fmt.Fprintf(md, "- %s\n", c)
-		}
-		md.WriteString("\n")
-	}
-	if !any {
+	if len(graphs) == 0 {
 		md.WriteString("_No calls collected_\n\n")
+		return
+	}
+	for _, g := range graphs {
+		renderCallGraphMarkdown(md, g)
 	}
 }
 
@@ -1514,7 +1768,7 @@ func writeOpenAPI(path string, docs []DocItem) error {
 	var b strings.Builder
 	b.WriteString("openapi: 3.0.3\ninfo:\n  title: Project API\n  version: 1.0.0\npaths:\n")
 	for p, ops := range paths {
-		fmt.Fprintf(&b, "  %s:\\n", p)
+		fmt.Fprintf(&b, "  %s:\n", p)
 		for _, o := range ops {
 			sum := o.Item.Summary
 			if sum == "" {
@@ -1546,5 +1800,80 @@ func writeOpenAPI(path string, docs []DocItem) error {
 	}
 	b.WriteString("components:\n  securitySchemes:\n    bearerAuth:\n      type: http\n      scheme: bearer\n      bearerFormat: JWT\n")
 
+	return os.WriteFile(path, []byte(b.String()), 0644)
+}
+
+// ========================= Mermaid render + HTML =========================
+
+func renderCallGraphMarkdown(md *bytes.Buffer, g CallGraph) {
+	// ASCII стек
+	md.WriteString("### " + g.Title + "\n\n")
+	for _, line := range g.ASCII {
+		md.WriteString(line + "\n")
+	}
+	md.WriteString("\n")
+
+	// Mermaid flowchart (рендерится в GitHub/VS Code/Obsidian)
+	md.WriteString("```mermaid\n")
+	md.WriteString("flowchart TD\n")
+	for _, n := range g.Nodes {
+		// n.ID — уникальный ID узла (без пробелов), n.Label — подпись
+		fmt.Fprintf(md, "  %s[%s]\n", n.ID, escapeMermaid(n.Label))
+	}
+	for _, e := range g.Edges {
+		// e.From, e.To — ID узлов; e.Label — подпись на ребре (можно пусто)
+		if e.Label != "" {
+			fmt.Fprintf(md, "  %s -->|%s| %s\n", e.From, escapeMermaid(e.Label), e.To)
+		} else {
+			fmt.Fprintf(md, "  %s --> %s\n", e.From, e.To)
+		}
+	}
+	md.WriteString("```\n\n---\n\n")
+}
+
+func escapeMermaid(s string) string {
+	// мермейд не любит обратные кавычки и «|»
+	s = strings.ReplaceAll(s, "|", "\\|")
+	s = strings.ReplaceAll(s, "`", "'")
+	return s
+}
+
+func writeFlowHTML(path string, all []CallGraph) error {
+	var b strings.Builder
+	b.WriteString(`<!doctype html><html><head><meta charset="utf-8">
+<title>Project Call Flows</title>
+<style>
+body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; margin:24px; line-height:1.4;}
+h2{margin:24px 0 12px}
+hr{margin:24px 0}
+.mermaid{margin:16px 0;border:1px solid #eee;border-radius:12px;padding:16px;}
+.details{color:#666;font-size:0.9em}
+</style>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+mermaid.initialize({ startOnLoad: true, securityLevel:"loose", theme: "default" });
+</script>
+</head><body>
+<h1>Project Call Flows</h1>
+<p class="details">Автосгенерированные графы от ручек к сервисам/репозиториям/SQL. Откройте этот файл локально в браузере.</p>
+`)
+
+	for _, g := range all {
+		b.WriteString("<h2>")
+		b.WriteString(html.EscapeString(g.Title))
+		b.WriteString("</h2>\n<div class=\"mermaid\">\nflowchart TD\n")
+		for _, n := range g.Nodes {
+			fmt.Fprintf(&b, "  %s[%s]\n", n.ID, escapeMermaid(n.Label))
+		}
+		for _, e := range g.Edges {
+			if e.Label != "" {
+				fmt.Fprintf(&b, "  %s -->|%s| %s\n", e.From, escapeMermaid(e.Label), e.To)
+			} else {
+				fmt.Fprintf(&b, "  %s --> %s\n", e.From, e.To)
+			}
+		}
+		b.WriteString("\n</div>\n<hr/>\n")
+	}
+	b.WriteString("</body></html>")
 	return os.WriteFile(path, []byte(b.String()), 0644)
 }
