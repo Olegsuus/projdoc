@@ -1,14 +1,15 @@
-// cmd/app/main.go
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,12 +19,14 @@ import (
 
 // ---------- CLI flags ----------
 var (
-	srcDir       = flag.String("src", ".", "Go source root")
-	migDir       = flag.String("migrations", "./migrations", "SQL migrations dir")
-	outFile      = flag.String("out", "docs.md", "Output markdown file")
-	emitMermaid  = flag.Bool("mermaid", true, "Emit Mermaid ER diagram")
-	sqlExts      = []string{".sql"}
-	goSkipVendor = true
+	srcDir                   = flag.String("src", ".", "Go source root")
+	migDir                   = flag.String("migrations", "./migrations", "SQL migrations dir")
+	outFile                  = flag.String("out", "docs.md", "Output markdown file")
+	emitMermaid              = flag.Bool("mermaid", true, "Emit Mermaid ER diagram")
+	sqlExts                  = []string{".sql"}
+	goSkipVendor             = true
+	reIsTableLevelConstraint = regexp.MustCompile(`(?is)^\s*(PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE|CHECK|CONSTRAINT|EXCLUDE|INDEX)\b`)
+	reTrimQuotes             = regexp.MustCompile(`^"(.*)"$`)
 )
 
 // ---------- Data models ----------
@@ -110,7 +113,7 @@ func main() {
 	flag.Parse()
 
 	// 1) Парсим миграции (без БД)
-	tables := parseMigrations(*migDir)
+	tables, _ := parseMigrations(*migDir)
 
 	// 2) Парсим Go-комментарии с @doc.* (и модели)
 	docs := parseGoDocs(*srcDir)
@@ -123,61 +126,6 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Generated %s\n", *outFile)
-}
-
-// ---------- SQL migrations parsing (primitive but useful) ----------
-func parseMigrations(dir string) []Table {
-	var files []string
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		for _, ext := range sqlExts {
-			if strings.HasSuffix(strings.ToLower(d.Name()), ext) {
-				files = append(files, path)
-				break
-			}
-		}
-		return nil
-	})
-
-	var schema = make(map[string]*Table)
-	for _, f := range files {
-		b, _ := os.ReadFile(f)
-		stmts := splitSQLStatements(string(b))
-
-		for _, s := range stmts {
-			up := strings.ToUpper(s)
-			switch {
-			case strings.HasPrefix(strings.TrimSpace(up), "CREATE TABLE"):
-				t := parseCreateTable(s)
-				if t.Name != "" {
-					if _, ok := schema[t.Name]; schema[t.Name] == nil || ok {
-						// merge primitive (idempotent for repeated migrations)
-						schema[t.Name] = mergeTables(schema[t.Name], &t)
-					}
-				}
-			case strings.HasPrefix(strings.TrimSpace(up), "ALTER TABLE"):
-				applyAlter(schema, s)
-			case strings.HasPrefix(strings.TrimSpace(up), "CREATE INDEX") ||
-				strings.HasPrefix(strings.TrimSpace(up), "CREATE UNIQUE INDEX"):
-				idx := parseCreateIndex(s)
-				if idx.Table != "" && schema[idx.Table] != nil {
-					schema[idx.Table].Indexes = upsertIndex(schema[idx.Table].Indexes, idx)
-				}
-			}
-		}
-	}
-
-	// to slice + sort
-	var out []Table
-	for _, t := range schema {
-		sort.Slice(t.Columns, func(i, j int) bool { return t.Columns[i].Name < t.Columns[j].Name })
-		sort.Strings(t.PrimaryKey)
-		out = append(out, *t)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }
 
 // very rough statement splitter — good enough for typical migrations
@@ -216,8 +164,204 @@ func splitSQLStatements(sql string) []string {
 	return out
 }
 
+func parseMigrations(dir string) ([]Table, error) {
+	if dir == "" {
+		return nil, errors.New("parseMigrations: empty dir")
+	}
+
+	var tables []Table
+
+	walkFn := func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(d.Name()), ".sql") {
+			return nil
+		}
+
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		content := sanitizeSQL(string(b))
+
+		// ВАЖНО: FindAllStringSubmatch — ловим все CREATE TABLE в одном файле
+		matches := reCreateTable.FindAllStringSubmatch(content, -1)
+		for _, m := range matches {
+			if len(m) < 4 {
+				continue
+			}
+
+			rawName := strings.TrimSpace(m[2]) // может быть "schema.table" или "table"
+			rawName = strings.TrimSpace(rawName)
+			if reTrimQuotes.MatchString(rawName) {
+				rawName = reTrimQuotes.ReplaceAllString(rawName, "$1")
+			}
+			colsBlock := strings.TrimSpace(m[3])
+
+			cols := parseColumns(colsBlock)
+
+			tables = append(tables, Table{
+				Name:    rawName,
+				Columns: cols,
+				//RawDefinition: colsBlock,
+			})
+		}
+		return nil
+	}
+
+	if err := filepath.WalkDir(dir, walkFn); err != nil {
+		return nil, err
+	}
+	return tables, nil
+}
+
+// -------------------- вспомогалки для колонок --------------------
+
+// parseColumns наивно разбивает содержимое скобок CREATE TABLE на колонки,
+// учитывая вложенные скобки, чтобы не резать по запятым внутри CHECK(...), REFERENCES(...).
+func parseColumns(block string) []Column {
+	parts := splitByCommasRespectingParens(block)
+
+	var cols []Column
+	for _, p := range parts {
+		line := strings.TrimSpace(p)
+		if line == "" {
+			continue
+		}
+		// пропускаем table-level constraints
+		if reIsTableLevelConstraint.MatchString(line) {
+			continue
+		}
+
+		// имя может быть в кавычках
+		toks := splitBySpaceRespectingQuotes(line)
+		if len(toks) < 2 {
+			// странная строка — пропустим
+			continue
+		}
+
+		colName := strings.TrimSpace(toks[0])
+		if reTrimQuotes.MatchString(colName) {
+			colName = reTrimQuotes.ReplaceAllString(colName, "$1")
+		}
+
+		typeEnd := findTypeEndIndex(toks[1:])
+		colType := strings.Join(toks[1:1+typeEnd], " ")
+
+		cols = append(cols, Column{
+			Name: colName,
+			Type: colType,
+		})
+	}
+
+	return cols
+}
+
+// splitByCommasRespectingParens режет строку по запятым, но игнорирует запятые внутри скобок.
+func splitByCommasRespectingParens(s string) []string {
+	var res []string
+	var buf strings.Builder
+	depth := 0
+
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch ch {
+		case '(':
+			depth++
+			buf.WriteByte(ch)
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			buf.WriteByte(ch)
+		case ',':
+			if depth == 0 {
+				res = append(res, buf.String())
+				buf.Reset()
+			} else {
+				buf.WriteByte(ch)
+			}
+		default:
+			buf.WriteByte(ch)
+		}
+	}
+	if buf.Len() > 0 {
+		res = append(res, buf.String())
+	}
+	return res
+}
+
+// splitBySpaceRespectingQuotes разбивает на токены по пробелам с учётом кавычек.
+func splitBySpaceRespectingQuotes(s string) []string {
+	var res []string
+	var buf strings.Builder
+	inQuotes := false
+
+	flush := func() {
+		if buf.Len() > 0 {
+			res = append(res, buf.String())
+			buf.Reset()
+		}
+	}
+
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch ch {
+		case '"':
+			inQuotes = !inQuotes
+			buf.WriteByte(ch)
+		case ' ', '\t', '\n', '\r':
+			if inQuotes {
+				buf.WriteByte(ch)
+			} else {
+				flush()
+			}
+		default:
+			buf.WriteByte(ch)
+		}
+	}
+	flush()
+	return res
+}
+
+// findTypeEndIndex ищет, сколько токенов относятся к типу до начала constraint-части.
+func findTypeEndIndex(tokens []string) int {
+	if len(tokens) == 0 {
+		return 0
+	}
+	// минимальный набор "стоп-слов" для constraint-части
+	stop := map[string]struct{}{
+		"PRIMARY":    {},
+		"KEY":        {},
+		"NOT":        {},
+		"NULL":       {},
+		"UNIQUE":     {},
+		"REFERENCES": {},
+		"CHECK":      {},
+		"DEFAULT":    {},
+		"COLLATE":    {},
+		"CONSTRAINT": {},
+	}
+	end := 0
+	for end < len(tokens) {
+		up := strings.ToUpper(strings.Trim(tokens[end], ","))
+		if _, found := stop[up]; found {
+			break
+		}
+		end++
+	}
+	if end == 0 {
+		return 1 // хотя бы один токен считаем типом
+	}
+	return end
+}
+
 var (
-	reCreateTable = regexp.MustCompile(`(?is)CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("?[\w.]+?"?)\s*$begin:math:text$(.+)$end:math:text$`)
+	reCreateTable = regexp.MustCompile(`(?is)CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("?[\w.]+?"?)\s*$begin:math:text$(.*?)$end:math:text$`)
 	reColLine     = regexp.MustCompile(`(?is)^\s*("?[\w.]+"?)\s+([^\s,]+)(.*)$`)
 	rePkInline    = regexp.MustCompile(`(?is)PRIMARY\s+KEY\s*\(([^)]+)\)`)
 	reFk          = regexp.MustCompile(`(?is)CONSTRAINT\s+"?[\w.]+"?\s+FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+("?[\w.]+"?)\s*\(([^)]+)\)([^,]*)`)
@@ -1005,4 +1149,25 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func sanitizeSQL(s string) string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+
+		// пропускаем служебные директивы goose
+		if strings.HasPrefix(t, "-- +goose") {
+			continue
+		}
+
+		// режем построчные комментарии
+		if idx := strings.Index(ln, "--"); idx >= 0 {
+			ln = ln[:idx]
+		}
+
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
 }
