@@ -217,7 +217,7 @@ func splitSQLStatements(sql string) []string {
 }
 
 var (
-	reCreateTable = regexp.MustCompile(`(?is)CREATE\s+TABLE\s+("?[\w.]+"?)\s*\((.+)\)`)
+	reCreateTable = regexp.MustCompile(`(?is)CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("?[\w.]+?"?)\s*$begin:math:text$(.+)$end:math:text$`)
 	reColLine     = regexp.MustCompile(`(?is)^\s*("?[\w.]+"?)\s+([^\s,]+)(.*)$`)
 	rePkInline    = regexp.MustCompile(`(?is)PRIMARY\s+KEY\s*\(([^)]+)\)`)
 	reFk          = regexp.MustCompile(`(?is)CONSTRAINT\s+"?[\w.]+"?\s+FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+("?[\w.]+"?)\s*\(([^)]+)\)([^,]*)`)
