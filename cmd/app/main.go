@@ -182,6 +182,7 @@ func main() {
 
 	// 8) Markdown
 	md := renderMarkdown(tables, docs, collectedModels, *emitMermaid, graphs)
+	md = sanitizeUTF8(md)
 	if err := os.WriteFile(*outFile, md, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", *outFile, err)
 		os.Exit(1)
@@ -229,17 +230,18 @@ func parseMigrations(dir string) ([]Table, error) {
 		if err != nil {
 			return nil
 		}
-		content := sanitizeSQL(string(b))
+		content := sanitizeUTF8(b) // <— вот это
+		text := sanitizeSQL(string(content))
 
 		// CREATE TABLE
-		for _, m := range reCreateTableStmt.FindAllStringSubmatch(content, -1) {
+		for _, m := range reCreateTableStmt.FindAllStringSubmatch(text, -1) {
 			name := unq(m[2])
 			body := strings.TrimSpace(m[3])
 			t := parseCreateTableBody(name, body)
 			upsertTable(schema, &t)
 		}
 		// CREATE INDEX
-		for _, m := range reCreateIndexStmt.FindAllStringSubmatch(content, -1) {
+		for _, m := range reCreateIndexStmt.FindAllStringSubmatch(text, -1) {
 			ix := Index{
 				Unique:  strings.TrimSpace(m[1]) != "",
 				Name:    unq(m[2]),
@@ -251,7 +253,7 @@ func parseMigrations(dir string) ([]Table, error) {
 			}
 		}
 		// ALTER TABLE
-		for _, m := range reAlterTableStmt.FindAllStringSubmatch(content, -1) {
+		for _, m := range reAlterTableStmt.FindAllStringSubmatch(text, -1) {
 			tbl := unq(m[1])
 			stmt := strings.TrimSpace(m[2])
 			applyAlter(schema, tbl, stmt)
@@ -1672,7 +1674,8 @@ func writeOpenAPI(path string, docs []DocItem) error {
 	}
 	b.WriteString("components:\n  securitySchemes:\n    bearerAuth:\n      type: http\n      scheme: bearer\n      bearerFormat: JWT\n")
 
-	return os.WriteFile(path, []byte(b.String()), 0644)
+	out := sanitizeUTF8([]byte(b.String()))
+	return os.WriteFile(path, out, 0644)
 }
 
 // ========================= Mermaid render + HTML =========================
@@ -1780,7 +1783,8 @@ mermaid.initialize({ startOnLoad: true, securityLevel:"loose", theme: "default" 
 		b.WriteString("\n</div>\n<hr/>\n")
 	}
 	b.WriteString("</body></html>")
-	return os.WriteFile(path, []byte(b.String()), 0644)
+	out := sanitizeUTF8([]byte(b.String()))
+	return os.WriteFile(path, out, 0644)
 }
 
 func writeDocSection(md *bytes.Buffer, docs []DocItem, want, title string, showRoutes bool) {
@@ -1882,4 +1886,10 @@ func writeDocSection(md *bytes.Buffer, docs []DocItem, want, title string, showR
 			md.WriteString("---\n\n")
 		}
 	}
+}
+
+func sanitizeUTF8(b []byte) []byte {
+	s := strings.ToValidUTF8(string(b), "")  // выкидывает/чинит «битые» байты
+	s = strings.ReplaceAll(s, "\u00A0", " ") // NBSP -> обычный пробел
+	return []byte(s)
 }
